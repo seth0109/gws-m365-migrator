@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Iterator
 from typing import Any
 
 import httpx
@@ -93,6 +94,11 @@ class GraphClient:
         resp = self._request("GET", f"{GRAPH_BASE}{path}", user_key=user_key, **kwargs)
         return resp.json()
 
+    def get_bytes(self, path: str, user_key: str | None = None, **kwargs: Any) -> bytes:
+        """GET raw response bytes (e.g. message MIME via /$value, file /content)."""
+        resp = self._request("GET", f"{GRAPH_BASE}{path}", user_key=user_key, **kwargs)
+        return resp.content
+
     def post(self, path: str, user_key: str | None = None, **kwargs: Any) -> Any:
         resp = self._request("POST", f"{GRAPH_BASE}{path}", user_key=user_key, **kwargs)
         if resp.content:
@@ -117,7 +123,9 @@ class GraphClient:
             return resp.json()
         return None
 
-    def paginate(self, path: str, user_key: str | None = None, **kwargs: Any):
+    def paginate(
+        self, path: str, user_key: str | None = None, **kwargs: Any
+    ) -> Iterator[list[dict[str, Any]]]:
         """Yield pages from a Graph collection, following @odata.nextLink."""
         url: str | None = f"{GRAPH_BASE}{path}"
         while url:

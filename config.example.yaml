@@ -1,31 +1,49 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Migration config. Pick ONE `source:` block (delete the others). The `destination:`
+# is always Microsoft 365. See the three source examples at the bottom of this file.
+# ─────────────────────────────────────────────────────────────────────────────
 state_db: migration_state.db
 log_level: INFO
 log_file: migrator.log
 
-google:
+# ── SOURCE (choose one type) ────────────────────────────────────────────────
+source:
+  type: google_workspace
   service_account_key_file: credentials/google-service-account.json
   admin_email: admin@yourdomain.com
-  # Read-only scopes — never write to Google
+  # Read-only scopes — the tool never writes to Google.
   scopes:
     - https://www.googleapis.com/auth/gmail.readonly
     - https://www.googleapis.com/auth/drive.readonly
     - https://www.googleapis.com/auth/contacts.readonly
     - https://www.googleapis.com/auth/calendar.readonly
 
-microsoft:
+# ── DESTINATION (Microsoft 365) ─────────────────────────────────────────────
+destination:
+  type: microsoft365
   tenant_id: "00000000-0000-0000-0000-000000000000"
   client_id: "00000000-0000-0000-0000-000000000000"
-  # Use certificate (preferred) or client secret
+  # Certificate (preferred) or client secret.
   certificate_path: credentials/ms-cert.pem
   certificate_thumbprint: "AABBCCDDEEFF..."
   # client_secret: "optional-if-not-using-cert"
   token_cache_file: .ms_token_cache.json
 
+# ── USER MAPPINGS (source identity → destination UPN) ───────────────────────
 users:
-  - google_email: alice@yourdomain.com
-    ms_upn: alice@yourtenant.onmicrosoft.com
-  - google_email: bob@yourdomain.com
-    ms_upn: bob@yourtenant.onmicrosoft.com
+  - source_id: alice@yourdomain.com
+    dest_id: alice@yourtenant.onmicrosoft.com
+  - source_id: bob@yourdomain.com
+    dest_id: bob@yourtenant.onmicrosoft.com
+
+# ── SHARED DRIVES → SHAREPOINT (google_workspace source only) ───────────────
+# Used by `migrator shared-drives`. Each drive auto-provisions a SharePoint site.
+shared_drives:
+  - drive_name: "Marketing"
+    target_site_alias: "marketing"        # mailNickname for the provisioned site
+    display_name: "Marketing (migrated)"  # optional; defaults to drive_name
+  # - drive_id: "0AKxxxxxxxxxxxxUk9PVA"
+  #   target_site_alias: "engineering"
 
 workloads:
   contacts:
@@ -48,3 +66,33 @@ rate_limits:
   google_requests_per_second: 10
   graph_requests_per_second: 4
   graph_requests_per_mailbox_per_minute: 120
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ALTERNATIVE SOURCE BLOCKS — replace the `source:` above with one of these.
+#
+# 1) IMAP / generic SMTP server (mail workload only). Per-user credentials live
+#    on each user mapping; prefer imap_password_env (reads from an env var).
+#
+#    source:
+#      type: imap
+#      host: imap.example.com
+#      port: 993
+#      use_ssl: true
+#      exclude_folders: ["Public Folders"]   # optional
+#    users:
+#      - source_id: alice@old.com
+#        dest_id: alice@yourtenant.onmicrosoft.com
+#        imap_user: alice@old.com
+#        imap_password_env: ALICE_IMAP_PW     # export ALICE_IMAP_PW=... before running
+#
+# 2) Microsoft 365 → Microsoft 365 (tenant-to-tenant). Source is the OTHER tenant.
+#    source_id / dest_id are the source-tenant and destination-tenant UPNs.
+#
+#    source:
+#      type: microsoft365
+#      tenant_id: "11111111-1111-1111-1111-111111111111"
+#      client_id: "11111111-1111-1111-1111-111111111111"
+#      certificate_path: credentials/source-ms-cert.pem
+#      certificate_thumbprint: "112233445566..."
+#      token_cache_file: .ms_source_token_cache.json
+# ─────────────────────────────────────────────────────────────────────────────

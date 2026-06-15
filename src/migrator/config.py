@@ -1,24 +1,65 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 import yaml
 from pydantic import BaseModel, Field
 
+_GOOGLE_READONLY_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/contacts.readonly",
+    "https://www.googleapis.com/auth/calendar.readonly",
+]
 
-class GoogleConfig(BaseModel):
+
+# --------------------------------------------------------------------------- #
+# Source configs (discriminated on `type`)
+# --------------------------------------------------------------------------- #
+class GoogleWorkspaceSourceConfig(BaseModel):
+    type: Literal["google_workspace"] = "google_workspace"
     service_account_key_file: Path
     admin_email: str
-    scopes: list[str] = Field(default_factory=lambda: [
-        "https://www.googleapis.com/auth/gmail.readonly",
-        "https://www.googleapis.com/auth/drive.readonly",
-        "https://www.googleapis.com/auth/contacts.readonly",
-        "https://www.googleapis.com/auth/calendar.readonly",
-    ])
+    scopes: list[str] = Field(default_factory=lambda: list(_GOOGLE_READONLY_SCOPES))
 
 
-class MicrosoftConfig(BaseModel):
+class ImapSourceConfig(BaseModel):
+    type: Literal["imap"] = "imap"
+    host: str
+    port: int = 993
+    use_ssl: bool = True
+    # Folders to skip entirely (e.g. server-specific virtual folders).
+    exclude_folders: list[str] = Field(default_factory=list)
+
+
+class Microsoft365SourceConfig(BaseModel):
+    type: Literal["microsoft365"] = "microsoft365"
+    tenant_id: str
+    client_id: str
+    certificate_path: Path | None = None
+    certificate_thumbprint: str | None = None
+    client_secret: str | None = None
+    token_cache_file: Path = Path(".ms_source_token_cache.json")
+
+
+SourceConfig = Annotated[
+    GoogleWorkspaceSourceConfig | ImapSourceConfig | Microsoft365SourceConfig,
+    Field(discriminator="type"),
+]
+
+# Backwards-compatible alias: the google connectors and google_auth type-hint
+# against `GoogleConfig`. The shape (service_account_key_file/admin_email/scopes)
+# is unchanged, so the alias keeps those modules working untouched.
+GoogleConfig = GoogleWorkspaceSourceConfig
+
+
+# --------------------------------------------------------------------------- #
+# Destination configs (only Microsoft 365 today)
+# --------------------------------------------------------------------------- #
+class Microsoft365DestinationConfig(BaseModel):
+    type: Literal["microsoft365"] = "microsoft365"
     tenant_id: str
     client_id: str
     certificate_path: Path | None = None
@@ -27,11 +68,45 @@ class MicrosoftConfig(BaseModel):
     token_cache_file: Path = Path(".ms_token_cache.json")
 
 
+# Only one destination type exists today; alias kept for symmetry/extensibility.
+DestinationConfig = Microsoft365DestinationConfig
+
+
+# --------------------------------------------------------------------------- #
+# User + shared-drive mappings
+# --------------------------------------------------------------------------- #
 class UserMapping(BaseModel):
-    google_email: str
-    ms_upn: str
+    source_id: str  # source identity (Google email / IMAP address / source-tenant UPN)
+    dest_id: str  # destination Microsoft 365 UPN
+
+    # IMAP source only — per-user credentials. Prefer imap_password_env (reads the
+    # secret from an environment variable) over the inline imap_password.
+    imap_user: str | None = None
+    imap_password_env: str | None = None
+    imap_password: str | None = None
+
+    def resolve_imap_password(self) -> str | None:
+        if self.imap_password_env:
+            return os.environ.get(self.imap_password_env)
+        return self.imap_password
 
 
+class SharedDriveMapping(BaseModel):
+    """A Google Shared Drive → SharePoint target. Identify the drive by name or id.
+
+    `target_site_alias` is the mailNickname used to auto-provision (and later
+    resolve) the SharePoint site backing this drive.
+    """
+
+    drive_name: str | None = None
+    drive_id: str | None = None
+    target_site_alias: str
+    display_name: str | None = None  # site display name; defaults to drive_name
+
+
+# --------------------------------------------------------------------------- #
+# Workloads + rate limits (unchanged shapes)
+# --------------------------------------------------------------------------- #
 class WorkloadConfig(BaseModel):
     enabled: bool = True
     concurrency: int = 4
@@ -62,9 +137,10 @@ class Config(BaseModel):
     state_db: Path = Path("migration_state.db")
     log_level: str = "INFO"
     log_file: Path | None = Path("migrator.log")
-    google: GoogleConfig
-    microsoft: MicrosoftConfig
+    source: SourceConfig
+    destination: DestinationConfig
     users: list[UserMapping]
+    shared_drives: list[SharedDriveMapping] = Field(default_factory=list)
     workloads: WorkloadsConfig = Field(default_factory=WorkloadsConfig)
     rate_limits: RateLimitsConfig = Field(default_factory=RateLimitsConfig)
 

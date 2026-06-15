@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import func, select
 
 from .config import Config
 from .state.db import init_db, session_scope
-from .state.models import ItemMap, JobRun
+from .state.models import ItemMap
 
 log = logging.getLogger(__name__)
 
@@ -15,14 +16,14 @@ log = logging.getLogger(__name__)
 def generate_report(cfg: Config, output_path: Path) -> None:
     init_db(cfg.state_db)
 
-    rows: list[dict] = []
+    rows: list[dict[str, Any]] = []
     with session_scope() as s:
         for user in cfg.users:
             for workload in ("contacts", "calendar", "files", "mail"):
                 counts = s.execute(
                     select(ItemMap.status, func.count(ItemMap.id))
                     .where(
-                        ItemMap.user_email == user.google_email,
+                        ItemMap.user_email == user.source_id,
                         ItemMap.workload == workload,
                     )
                     .group_by(ItemMap.status)
@@ -30,7 +31,7 @@ def generate_report(cfg: Config, output_path: Path) -> None:
 
                 status_map = {status: count for status, count in counts}
                 rows.append({
-                    "user": user.google_email,
+                    "user": user.source_id,
                     "workload": workload,
                     "done": status_map.get("done", 0),
                     "failed": status_map.get("failed", 0),
@@ -38,7 +39,7 @@ def generate_report(cfg: Config, output_path: Path) -> None:
                     "pending": status_map.get("pending", 0),
                 })
 
-        failures: list[dict] = []
+        failures: list[dict[str, Any]] = []
         fail_rows = s.execute(
             select(ItemMap)
             .where(ItemMap.status == "failed")
@@ -56,8 +57,8 @@ def generate_report(cfg: Config, output_path: Path) -> None:
 
 
 def _write_html(
-    rows: list[dict],
-    failures: list[dict],
+    rows: list[dict[str, Any]],
+    failures: list[dict[str, Any]],
     output_path: Path,
 ) -> None:
     html_rows = "\n".join(

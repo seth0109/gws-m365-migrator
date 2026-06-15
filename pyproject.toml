@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "gws-m365-migrator"
 version = "0.1.0"
-description = "Google Workspace to Microsoft 365 migration tool"
+description = "Multi-source (Google Workspace, IMAP, Microsoft 365) to Microsoft 365 migration tool"
 requires-python = ">=3.11"
 dependencies = [
     "google-api-python-client>=2.120.0",

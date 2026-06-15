@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -11,8 +11,8 @@ log = logging.getLogger(__name__)
 
 CSV_COLUMNS = [
     "timestamp",
-    "user_email",
-    "ms_upn",
+    "source_user",
+    "dest_user",
     "workload",
     "source_id",
     "source_path",
@@ -46,8 +46,8 @@ class ManifestWriter:
     def add(
         self,
         *,
-        user_email: str,
-        ms_upn: str,
+        source_user: str,
+        dest_user: str,
         workload: str,
         source_id: str,
         source_path: str = "",
@@ -59,9 +59,9 @@ class ManifestWriter:
         notes: str = "",
     ) -> None:
         row: dict[str, Any] = {
-            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "user_email": user_email,
-            "ms_upn": ms_upn,
+            "timestamp": datetime.now(UTC).isoformat(timespec="seconds"),
+            "source_user": source_user,
+            "dest_user": dest_user,
             "workload": workload,
             "source_id": source_id,
             "source_path": source_path,
