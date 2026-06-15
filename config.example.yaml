@@ -1,0 +1,50 @@
+state_db: migration_state.db
+log_level: INFO
+log_file: migrator.log
+
+google:
+  service_account_key_file: credentials/google-service-account.json
+  admin_email: admin@yourdomain.com
+  # Read-only scopes — never write to Google
+  scopes:
+    - https://www.googleapis.com/auth/gmail.readonly
+    - https://www.googleapis.com/auth/drive.readonly
+    - https://www.googleapis.com/auth/contacts.readonly
+    - https://www.googleapis.com/auth/calendar.readonly
+
+microsoft:
+  tenant_id: "00000000-0000-0000-0000-000000000000"
+  client_id: "00000000-0000-0000-0000-000000000000"
+  # Use certificate (preferred) or client secret
+  certificate_path: credentials/ms-cert.pem
+  certificate_thumbprint: "AABBCCDDEEFF..."
+  # client_secret: "optional-if-not-using-cert"
+  token_cache_file: .ms_token_cache.json
+
+users:
+  - google_email: alice@yourdomain.com
+    ms_upn: alice@yourtenant.onmicrosoft.com
+  - google_email: bob@yourdomain.com
+    ms_upn: bob@yourtenant.onmicrosoft.com
+
+workloads:
+  contacts:
+    enabled: true
+    concurrency: 4
+  calendar:
+    enabled: true
+    concurrency: 4
+  files:
+    enabled: true
+    concurrency: 2
+    chunk_size_bytes: 10485760  # 10 MB
+  mail:
+    enabled: true
+    concurrency: 2
+    # "categories" (default) or "duplicate"
+    multi_label_policy: categories
+
+rate_limits:
+  google_requests_per_second: 10
+  graph_requests_per_second: 4
+  graph_requests_per_mailbox_per_minute: 120

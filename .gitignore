@@ -1,0 +1,36 @@
+# --- Secrets & credentials (NEVER commit) ---
+credentials/
+credentials
+config.yaml
+*.pem
+*.key
+*.p12
+*.pfx
+# Microsoft / Google token caches
+.ms_token_cache.json
+*token_cache*.json
+*.token
+token.json
+
+# --- Project state & logs ---
+migration_state.db
+*.db
+*.sqlite
+*.sqlite3
+migrator.log
+*.log
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
