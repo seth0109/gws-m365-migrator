@@ -9,6 +9,7 @@ from ..microsoft.calendar import create_event, delete_event, ensure_calendar
 from ..microsoft.graph_client import GraphClient
 from ..state.db import get_cursor, is_done, save_cursor, session_scope, upsert_item
 from ..state.models import ItemMap
+from ..transform.identities import IdentityMap
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +28,10 @@ def run_calendar(ctx: JobContext) -> None:
     ms_user = gc.get(f"/users/{user.dest_id}", params={"$select": "id"})
     ms_user_id: str = ms_user["id"]
 
+    # Rewrite source-tenant attendee/organizer addresses to destination UPNs so
+    # migrated events don't reference dead source mailboxes.
+    identities = IdentityMap(ctx.config.users)
+
     for cal in ctx.source.list_calendars(user):
         ms_cal_id = ensure_calendar(gc, ms_user_id, cal.name)
         key = f"calendar:{cal.cal_id}"
@@ -42,6 +47,7 @@ def run_calendar(ctx: JobContext) -> None:
                 if event.is_cancelled:
                     _handle_cancelled(gc, ms_user_id, user.source_id, key, event.source_id)
                     continue
+                identities.remap_event(event.graph_body)
                 dest_id = create_event(gc, ms_user_id, ms_cal_id, event.graph_body)
                 with session_scope() as s:
                     upsert_item(

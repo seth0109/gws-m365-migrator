@@ -187,7 +187,7 @@ This allows workloads to run independently, be enabled/disabled, and be re-run w
 - **labels.py** — `label_to_folder_path()` maps a Gmail label to an Outlook folder path (rewriting `/` separators to `\`). `resolve_label_placement()` is the core mail-foldering logic: it maps system labels to well-known Outlook folders (via `SYSTEM_LABEL_FOLDER`; some resolve to `None` and become flags/categories or are skipped) and applies `MailWorkloadConfig.multi_label_policy` to user labels — `"categories"` files a message in one primary folder and attaches the rest as Outlook categories, `"duplicate"` copies it into every label's folder. Returns `(folder_paths, categories)`.
 - **recurrence.py** — `rrule_to_graph_recurrence()` converts an iCal RRULE string + start datetime into a Graph `recurrence` object (pattern + range). Handles BYDAY→daysOfWeek, weekly/monthly/yearly indices, and the weekday derived from the event start.
 - **paths.py** — `sanitize_segment()` / `sanitize_path()` strip characters illegal in OneDrive/SharePoint names so Drive folder structures map cleanly.
-- **identities.py** — `IdentityMap` resolves Google email addresses to MS UPNs (from `config.users`) when rewriting attendees, sharing, and sender/recipient fields.
+- **identities.py** — `IdentityMap` rewrites source identities to destination M365 UPNs using `config.users` (`source_id` → `dest_id`) as the source of truth — pure/deterministic, no Graph calls. `map_address()` returns the mapped address (or the original when unmapped, so external attendees pass through); `remap_event()` rewrites attendee + organizer addresses on a Graph event body in place. Applied by `calendar_job.run_calendar` before `create_event`, so migrated events reference live destination mailboxes rather than dead source ones.
 
 ### Whatif Manifest Injection
 
@@ -196,3 +196,25 @@ Parallel to `_current_config`, the package holds `_pkg._current_manifest: Manife
 ### Microsoft Auth Modes
 
 `MSTokenProvider` (auth/ms_auth.py) is an MSAL confidential-client provider with a thread lock and serialized disk token cache. It accepts **either** `certificate_path` + `certificate_thumbprint` (preferred) **or** `client_secret`; supplying neither raises at construction. Scope is fixed to `https://graph.microsoft.com/.default` (app-only). Each per-thread GraphClient holds its own provider — see "Threading & Job Dispatch".
+
+## Known Gaps / TODO
+
+Open work items identified during review (roughly ordered by data-fidelity impact). None of these are wired up yet — treat as the backlog.
+
+### Correctness / data fidelity
+- **Timestamp-based delta for mail/contacts/calendar is lossy.** Only files use real Graph delta tokens; mail/contacts/calendar set the cursor to "now" and filter on `receivedDateTime`/`lastModifiedDateTime ge since` (`connectors/m365.py`). This misses folder moves and read/flag/category changes after cutover, and is clock-skew sensitive. Move these workloads to proper Graph delta queries (`/messages/delta`, `/contacts/delta`, `/events/delta`).
+- ~~**Calendar attendees/organizer keep source-tenant addresses.**~~ *Done.* `calendar_job.run_calendar` now applies `transform/identities.py:IdentityMap.remap_event()` (config-driven `source_id`→`dest_id`) to each event body before `create_event`, rewriting attendee + organizer addresses to destination UPNs. Note the M365 source still doesn't carry `organizer` in `_EVENT_FIELDS` (Graph sets organizer to the calendar owner on create), so the organizer remap is defensive for now.
+- **Recurring-event exceptions are lost.** Only the series master + plain instances are pulled; modified single occurrences of a recurring series aren't reconciled.
+- **No contact photos or calendar attachments.** `_CONTACT_FIELDS` omits the photo; `create_event` posts only the body, not event attachments.
+
+### Coverage / functionality
+- **No permissions/sharing migration.** `SourceFile` carries no ACL data — Drive/SharePoint sharing, link permissions, and ownership are dropped. Commonly required; needs a permissions model on `SourceFile` plus a destination writer.
+- **`validate` report can't detect data loss.** `reporting.py` only counts local `ItemMap` statuses — it never reconciles source vs. destination item counts/checksums, so silently-skipped or never-enumerated items won't surface. Add source↔dest reconciliation. *(Partly addressed: the report no longer hardcodes `("contacts","calendar","files","mail")` — it now discovers every `(user, workload)` pair from `ItemMap` so `shared_drive:*` / `sharepoint_site:*` results appear, unioned with the standard per-user workloads so a configured user with zero rows still surfaces.)*
+- **Thin pre-flight checks.** `smoke-test` probes one pilot user only; there's no bulk validation that all `dest_id` mailboxes exist / are licensed / are provisioned before a `run-all`.
+
+### Reliability / scale
+- **Files are fully buffered in memory.** `fetch_file` returns full `bytes` and the upload writers take full `content: bytes` — a multi-GB file is loaded entirely into RAM on both download and upload. Stream download→upload to cap memory and lift the practical file-size ceiling.
+- **Tenant-level SharePoint/Shared-Drive flows are single-threaded.** `run_shared_drives` / `run_sharepoint_sites` loop drives and files sequentially (no `ThreadPoolExecutor`), unlike the per-user workloads. Parallelize for large libraries.
+
+### Testing
+- **Job/writer paths lack mocked-Graph coverage.** Tests are mostly pure-logic plus the new mail-writer tests; the per-user job loops (contacts/calendar/files/mail) and the Graph writers have no fake-client integration tests. Add a recording/fake GraphClient harness and cover the job loops end-to-end.
