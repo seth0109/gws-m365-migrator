@@ -119,9 +119,16 @@ def export_native_file(
     return request.execute()
 
 
-def get_changes_start_token(cfg: GoogleConfig, user_email: str) -> str:
+def get_changes_start_token(
+    cfg: GoogleConfig, user_email: str, drive_id: str | None = None
+) -> str:
+    """Start page token for the Changes API. Pass `drive_id` to scope the cursor
+    to a single shared drive (otherwise it tracks the user's My Drive corpus)."""
     svc = _svc(cfg, user_email)
-    resp = svc.changes().getStartPageToken().execute()
+    params: dict[str, Any] = {}
+    if drive_id:
+        params = {"driveId": drive_id, "supportsAllDrives": True}
+    resp = svc.changes().getStartPageToken(**params).execute()
     return resp["startPageToken"]
 
 
@@ -129,28 +136,32 @@ def iter_drive_changes(
     cfg: GoogleConfig,
     user_email: str,
     page_token: str,
+    drive_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Return (changed_files, new_page_token) using the Drive Changes API.
 
     Only returns non-trashed, non-removed file changes. The new_page_token
-    should be saved as the cursor for the next delta run.
+    should be saved as the cursor for the next delta run. Pass `drive_id` to scope
+    the change feed to a single shared drive.
     """
     svc = _svc(cfg, user_email)
     files: list[dict[str, Any]] = []
     current_token = page_token
+    list_params: dict[str, Any] = {
+        "fields": f"nextPageToken, newStartPageToken, changes(type, removed, fileId, file({_FILE_FIELDS}))",
+        "pageSize": 1000,
+        "includeItemsFromAllDrives": True,
+        "supportsAllDrives": True,
+    }
+    if drive_id:
+        list_params["driveId"] = drive_id
 
     while True:
         try:
             registry.acquire("google_global")
         except KeyError:
             pass
-        resp = svc.changes().list(
-            pageToken=current_token,
-            fields=f"nextPageToken, newStartPageToken, changes(type, removed, fileId, file({_FILE_FIELDS}))",
-            pageSize=1000,
-            includeItemsFromAllDrives=True,
-            supportsAllDrives=True,
-        ).execute()
+        resp = svc.changes().list(pageToken=current_token, **list_params).execute()
 
         for change in resp.get("changes", []):
             if change.get("type") != "file" or change.get("removed"):

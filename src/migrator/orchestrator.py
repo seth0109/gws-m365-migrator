@@ -96,8 +96,11 @@ class Orchestrator:
         )
         return build_source(self.config, source_graph_client_factory=factory)
 
-    def run_shared_drives(self) -> None:
-        """Migrate configured Google Shared Drives → SharePoint (tenant-level)."""
+    def run_shared_drives(self, mode: str = "full") -> None:
+        """Migrate configured Google Shared Drives → SharePoint (tenant-level).
+
+        `mode="delta"` reads the per-drive sync cursor stored by the previous run
+        and migrates only changed files."""
         from .workloads.files_job import run_shared_drives as job
 
         src_cfg = self.config.source
@@ -110,12 +113,15 @@ class Orchestrator:
         impersonation = UserMapping(source_id=src_cfg.admin_email, dest_id="")
         with self._build_source() as source, self.dest_graph_client() as gc:
             ctx = JobContext(
-                user=impersonation, source=source, dest_gc=gc, mode="full", config=self.config
+                user=impersonation, source=source, dest_gc=gc, mode=mode, config=self.config
             )
             job(ctx)
 
-    def run_sharepoint_sites(self) -> None:
-        """Migrate configured SharePoint sites between M365 tenants (tenant-level)."""
+    def run_sharepoint_sites(self, mode: str = "full") -> None:
+        """Migrate configured SharePoint sites between M365 tenants (tenant-level).
+
+        `mode="delta"` reads the per-site sync cursor stored by the previous run
+        and migrates only changed files."""
         from .workloads.files_job import run_sharepoint_sites as job
 
         if not isinstance(self.config.source, Microsoft365SourceConfig):
@@ -127,7 +133,7 @@ class Orchestrator:
         sentinel = UserMapping(source_id="__sharepoint__", dest_id="")
         with self._build_source() as source, self.dest_graph_client() as gc:
             ctx = JobContext(
-                user=sentinel, source=source, dest_gc=gc, mode="full", config=self.config
+                user=sentinel, source=source, dest_gc=gc, mode=mode, config=self.config
             )
             job(ctx)
 

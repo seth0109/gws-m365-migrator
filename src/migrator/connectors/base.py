@@ -145,7 +145,7 @@ class BaseSource:
         raise NotImplementedError
 
     def iter_shared_drive_files(
-        self, user: UserMapping, drive: SharedDriveRef
+        self, user: UserMapping, drive: SharedDriveRef, since: str | None = None
     ) -> Iterator[SourceFile]:
         raise NotImplementedError
 

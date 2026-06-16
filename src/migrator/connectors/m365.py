@@ -32,6 +32,18 @@ _EVENT_FIELDS = (
 
 _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
+# Graph wellKnownName → canonical token shared with the destination writer
+# (microsoft/mail.py:WELL_KNOWN_FOLDER_IDS) and the other sources, so a system
+# folder maps to the real well-known destination folder rather than a duplicate.
+_WELLKNOWN_TO_TOKEN = {
+    "inbox": "Inbox",
+    "sentitems": "SentItems",
+    "drafts": "Drafts",
+    "deleteditems": "DeletedItems",
+    "junkemail": "JunkEmail",
+    "archive": "Archive",
+}
+
 
 def _strip_base(url: str) -> str:
     """Turn an absolute Graph URL (next/deltaLink) into a path GraphClient accepts."""
@@ -88,9 +100,14 @@ class M365Source(BaseSource):
 
         def walk(parent_path: str, container: str) -> None:
             for f in self._paginate(
-                f"/users/{uid}/{container}?$top=100&$select=id,displayName", user_key=uid
+                f"/users/{uid}/{container}?$top=100&$select=id,displayName,wellKnownName",
+                user_key=uid,
             ):
-                name = f.get("displayName", f["id"])
+                # Top-level system folders map to a canonical token the destination
+                # writer routes to the real well-known folder; everything else keeps
+                # its display name.
+                token = _WELLKNOWN_TO_TOKEN.get(f.get("wellKnownName") or "")
+                name = token if (token and not parent_path) else f.get("displayName", f["id"])
                 full = f"{parent_path}\\{name}" if parent_path else name
                 paths[f["id"]] = full
                 walk(full, f"mailFolders/{f['id']}/childFolders")

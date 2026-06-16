@@ -38,9 +38,10 @@ migrator contacts --config config.yaml      # Migrate contacts
 migrator calendar --config config.yaml      # Migrate calendar
 migrator files --config config.yaml         # Migrate personal files → OneDrive
 migrator mail --config config.yaml          # Migrate mail (Gmail / IMAP / M365 source) → Outlook
-migrator shared-drives --config config.yaml # Google Shared Drives → SharePoint (auto-provision sites)
+migrator shared-drives --config config.yaml # Google Shared Drives → SharePoint (auto-provision sites); --delta for changed-only
+migrator sharepoint --config config.yaml    # M365 SharePoint sites → M365 (tenant-to-tenant); --delta for changed-only
 migrator run-all --config config.yaml       # Run all enabled + source-supported workloads sequentially
-migrator delta --config config.yaml         # Delta sync (post-cutover) using stored cursors
+migrator delta --config config.yaml         # Delta sync (post-cutover) using stored cursors (per-user workloads)
 migrator whatif --config config.yaml --output whatif_manifest.csv  # Dry-run inventory CSV
 migrator smoke-test --config config.yaml    # Phase 0 test: probe source, write+delete a dest test folder
 migrator validate --config config.yaml --output report.html  # Generate validation report
@@ -164,6 +165,10 @@ Two SharePoint flows exist; both bypass the per-user `run_workload` path and ins
 - **`migrator sharepoint`** (microsoft365 source) — `Orchestrator.run_sharepoint_sites()` migrates SharePoint libraries tenant-to-tenant. `M365Source.resolve_site_drive()` resolves the source site's library drive; the destination is an existing `dest_site` (`resolve_existing_site_drive()`) or an auto-provisioned `target_site_alias` (reusing `ensure_site_for_drive()`).
 
 `M365Source` file reads are **drive-generic**: `_iter_drive(drive_root, …)` walks any drive's delta feed and stamps `SourceFile.drive_root` so `fetch_file()` reads content from the right drive (OneDrive `users/<id>/drive` or SharePoint `drives/<id>`). Both flows require `Group.ReadWrite.All` + `Sites.*` on the destination app (only auto-provisioning needs `Group.ReadWrite.All`).
+
+**Delta support.** Both flows accept `--delta` (`Orchestrator.run_shared_drives(mode=...)` / `run_sharepoint_sites(mode=...)`), mirroring the per-mailbox delta handling in `files_job.run_files`. The two helpers `files_job._delta_cursor()` / `_persist_cursor()` wrap the SyncCursor read/write: a full pass passes `since=None` and persists the cursor the connector captured during iteration; a delta pass reads the stored cursor and passes it as `since` (skipping any drive/site with no seeded cursor). Cursors are namespaced in SyncCursor by the per-flow workload string (`shared_drive:<drive_id>` / `sharepoint_site:<site_id>`) under `ctx.user.source_id` (the impersonation admin / the `__sharepoint__` sentinel).
+> - **shared-drives** (Google source): `iter_shared_drive_files(user, drive, since)` captures a per-drive Changes-API page token (`drive.py:get_changes_start_token(drive_id=…)`) on the full pass and uses `iter_drive_changes(…, drive_id=…)` on delta. Connector cursor key == workload string (`shared_drive:<drive_id>`).
+> - **sharepoint** (M365 source): `iter_site_files(drive_id, since)` → `_iter_drive()` captures the Graph deltaLink under connector key `sharepoint:<source_drive_id>`; the job re-reads it via that key but persists/loads SyncCursor under `sharepoint_site:<source_site_id>`.
 
 ### Workload Structure
 

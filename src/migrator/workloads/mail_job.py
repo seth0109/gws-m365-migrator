@@ -3,7 +3,12 @@ from __future__ import annotations
 import logging
 
 from ..context import JobContext
-from ..microsoft.mail import ensure_mail_folder, import_mime_message, patch_message_flags
+from ..microsoft.mail import (
+    ensure_mail_folder,
+    import_mime_message,
+    patch_message_flags,
+    resolve_folder_segment,
+)
 from ..state.db import get_cursor, is_done, save_cursor, session_scope, upsert_folder, upsert_item
 
 log = logging.getLogger(__name__)
@@ -39,12 +44,15 @@ def run_mail(ctx: JobContext) -> None:
             current_path = "\\".join(parts[: i + 1])
             if current_path in folder_cache:
                 parent_id = folder_cache[current_path]
-            else:
-                fid = ensure_mail_folder(gc, ms_user_id, part, parent_id)
-                folder_cache[current_path] = fid
-                with session_scope() as s:
-                    upsert_folder(s, user.source_id, "mail", current_path, fid, current_path)
-                parent_id = fid
+                continue
+            # Route a top-level system folder (Inbox/SentItems/...) to its
+            # well-known Graph folder id instead of creating a duplicate.
+            wk = resolve_folder_segment(part, is_top_level=(i == 0))
+            fid = wk if wk is not None else ensure_mail_folder(gc, ms_user_id, part, parent_id)
+            folder_cache[current_path] = fid
+            with session_scope() as s:
+                upsert_folder(s, user.source_id, "mail", current_path, fid, current_path)
+            parent_id = fid
         return folder_cache[path]
 
     for msg in ctx.source.iter_messages(user, since):

@@ -123,10 +123,24 @@ class GoogleWorkspaceSource(BaseSource):
         ]
 
     def iter_shared_drive_files(
-        self, user: UserMapping, drive: SharedDriveRef
+        self, user: UserMapping, drive: SharedDriveRef, since: str | None = None
     ) -> Iterator[SourceFile]:
-        for gfile in iter_shared_drive_files(self.cfg, user.source_id, drive.drive_id):
-            yield self._to_file(gfile)
+        key = f"shared_drive:{drive.drive_id}"
+        if since is None:
+            # Capture the per-drive change cursor before the full enumeration so
+            # the next delta pass sees anything that lands mid-run.
+            self._set_cursor(
+                key, get_changes_start_token(self.cfg, user.source_id, drive.drive_id)
+            )
+            for gfile in iter_shared_drive_files(self.cfg, user.source_id, drive.drive_id):
+                yield self._to_file(gfile)
+        else:
+            changed, new_token = iter_drive_changes(
+                self.cfg, user.source_id, since, drive.drive_id
+            )
+            self._set_cursor(key, new_token)
+            for gfile in changed:
+                yield self._to_file(gfile)
 
     def _to_file(self, gfile: dict[str, Any]) -> SourceFile:
         mime = gfile.get("mimeType", "")

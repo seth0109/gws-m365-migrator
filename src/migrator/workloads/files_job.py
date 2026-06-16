@@ -102,10 +102,18 @@ def run_shared_drives(ctx: JobContext) -> None:
         drive_root = f"drives/{library_drive_id}"
         workload = f"shared_drive:{drive.drive_id}"
         folder_id_cache: dict[str, str] = {}
-        for f in ctx.source.iter_shared_drive_files(ctx.user, drive):
+
+        run, since = _delta_cursor(ctx, workload, label=drive.name)
+        if not run:
+            continue
+
+        for f in ctx.source.iter_shared_drive_files(ctx.user, drive, since):
             _process_file(
                 ctx, gc, drive_root, library_drive_id, f, folder_id_cache, workload=workload
             )
+
+        # Connector cursor key for shared drives matches the workload string.
+        _persist_cursor(ctx, workload, cursor_key=workload)
 
 
 def run_sharepoint_sites(ctx: JobContext) -> None:
@@ -139,9 +147,19 @@ def run_sharepoint_sites(ctx: JobContext) -> None:
         log.info("SharePoint %s → dest drive %s", mapping.source_site, dest_drive_id)
         drive_root = f"drives/{dest_drive_id}"
         workload = f"sharepoint_site:{source_site_id}"
+        # The connector stamps the deltaLink under a key derived from the *source*
+        # drive id; persist it per source site.
+        cursor_key = f"sharepoint:{source_drive_id}"
         folder_id_cache: dict[str, str] = {}
-        for f in ctx.source.iter_site_files(source_drive_id, None):
+
+        run, since = _delta_cursor(ctx, workload, label=mapping.source_site)
+        if not run:
+            continue
+
+        for f in ctx.source.iter_site_files(source_drive_id, since):
             _process_file(ctx, gc, drive_root, dest_drive_id, f, folder_id_cache, workload=workload)
+
+        _persist_cursor(ctx, workload, cursor_key=cursor_key)
 
 
 def _process_file(
@@ -229,6 +247,30 @@ def _process_file(
 def _get_root_id(gc: GraphClient, drive_root: str, user_key: str) -> str:
     root = gc.get(f"/{drive_root}/root", params={"$select": "id"}, user_key=user_key)
     return str(root["id"])
+
+
+def _delta_cursor(ctx: JobContext, workload: str, label: str) -> tuple[bool, str | None]:
+    """Resolve the `since` value for one drive/site in the tenant-level SharePoint
+    flows. A full pass returns ``(True, None)``. A delta pass returns the stored
+    cursor, or ``(False, None)`` when none exists yet (so the caller skips it and
+    waits for a full pass to seed one)."""
+    if ctx.mode != "delta":
+        return True, None
+    with session_scope() as s:
+        cursor = get_cursor(s, ctx.user.source_id, workload)
+    if not cursor:
+        log.warning("No delta cursor for %s — run a full pass first; skipping", label)
+        return False, None
+    return True, cursor
+
+
+def _persist_cursor(ctx: JobContext, workload: str, cursor_key: str) -> None:
+    """Save the cursor the connector captured during iteration under `cursor_key`,
+    namespaced in SyncCursor by `workload`."""
+    new_cursor = ctx.source.get_last_cursor(cursor_key)
+    if new_cursor:
+        with session_scope() as s:
+            save_cursor(s, ctx.user.source_id, workload, new_cursor)
 
 
 def _whatif_files(ctx: JobContext) -> None:

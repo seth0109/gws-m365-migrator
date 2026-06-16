@@ -115,25 +115,31 @@ def mail(
 @app.command("shared-drives")
 def shared_drives(
     config: Annotated[Path, _CONFIG_OPT] = Path("config.yaml"),
+    delta: Annotated[
+        bool, typer.Option("--delta", help="Migrate only files changed since the last run.")
+    ] = False,
 ) -> None:
     """Migrate Google Shared Drives → SharePoint (auto-provisions a site per drive)."""
     orch = _build_orchestrator(config)
     if orch.config.source.type != "google_workspace":
         console.print("[red]shared-drives is only available for a google_workspace source.")
         raise typer.Exit(1)
-    orch.run_shared_drives()
+    orch.run_shared_drives(mode="delta" if delta else "full")
 
 
 @app.command()
 def sharepoint(
     config: Annotated[Path, _CONFIG_OPT] = Path("config.yaml"),
+    delta: Annotated[
+        bool, typer.Option("--delta", help="Migrate only files changed since the last run.")
+    ] = False,
 ) -> None:
     """Migrate SharePoint sites between Microsoft 365 tenants (microsoft365 source)."""
     orch = _build_orchestrator(config)
     if orch.config.source.type != "microsoft365":
         console.print("[red]sharepoint is only available for a microsoft365 source.")
         raise typer.Exit(1)
-    orch.run_sharepoint_sites()
+    orch.run_sharepoint_sites(mode="delta" if delta else "full")
 
 
 @app.command("run-all")

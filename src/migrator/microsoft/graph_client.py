@@ -49,11 +49,14 @@ class GraphClient:
         self._per_user_limiter = per_user_limiter
         self._client = httpx.Client(timeout=timeout)
 
-    def _headers(self) -> dict[str, str]:
-        return {
+    def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+        headers = {
             "Authorization": f"Bearer {self._token_provider.get_token()}",
             "Content-Type": "application/json",
         }
+        if extra:
+            headers.update(extra)  # caller may override Content-Type, add Content-Range, etc.
+        return headers
 
     def _apply_rate_limits(self, user_key: str | None) -> None:
         try:
@@ -71,6 +74,7 @@ class GraphClient:
         **kwargs: Any,
     ) -> httpx.Response:
         self._apply_rate_limits(user_key)
+        extra_headers = kwargs.pop("headers", None)
 
         @retry(
             retry=retry_if_exception(_is_retryable),
@@ -79,7 +83,9 @@ class GraphClient:
             reraise=True,
         )
         def _do() -> httpx.Response:
-            resp = self._client.request(method, url, headers=self._headers(), **kwargs)
+            resp = self._client.request(
+                method, url, headers=self._headers(extra_headers), **kwargs
+            )
             if resp.status_code == 429:
                 retry_after = int(resp.headers.get("Retry-After", "30"))
                 log.warning("Graph 429 on %s — sleeping %ss", url, retry_after)
@@ -115,10 +121,11 @@ class GraphClient:
         self._request("DELETE", f"{GRAPH_BASE}{path}", user_key=user_key, **kwargs)
 
     def put_raw(self, url: str, data: bytes, user_key: str | None = None, **kwargs: Any) -> Any:
-        """Used for chunked upload sessions (absolute URL, not path-relative)."""
-        self._apply_rate_limits(user_key)
-        resp = self._client.put(url, content=data, headers=self._headers(), **kwargs)
-        resp.raise_for_status()
+        """Used for chunked upload sessions (absolute URL, not path-relative).
+
+        Routed through _request so chunk PUTs get rate limiting, tenacity retry,
+        and 429/Retry-After handling — the throttle-prone large-upload path."""
+        resp = self._request("PUT", url, user_key=user_key, content=data, **kwargs)
         if resp.content:
             return resp.json()
         return None

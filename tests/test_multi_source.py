@@ -196,3 +196,287 @@ def test_sourcefile_carries_drive_root() -> None:
     f = SourceFile(source_id="1", name="x", mime_type="", parent_id=None, is_folder=False,
                    drive_root="drives/abc")
     assert f.drive_root == "drives/abc"
+
+
+# --------------------------------------------------------------------------- #
+# Delta cursor persistence for the tenant-level SharePoint flows
+# --------------------------------------------------------------------------- #
+def test_sharepoint_sites_delta_persists_and_reads_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from migrator.state.db import get_cursor, init_db, session_scope
+    from migrator.workloads import files_job
+
+    init_db(tmp_path / "state.db")
+    monkeypatch.setattr(
+        files_job, "resolve_existing_site_drive", lambda gc, site: ("dest-site", "dest-drive")
+    )
+
+    cfg = Config.model_validate({
+        **_base_config({"type": "microsoft365", "tenant_id": "x", "client_id": "y"}),
+        "sharepoint_sites": [
+            {"source_site": "contoso.sharepoint.com:/sites/Eng",
+             "dest_site": "fabrikam.sharepoint.com:/sites/Eng"},
+        ],
+    })
+
+    class FakeSite(BaseSource):
+        capabilities = {"files"}
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen_since: object = "UNSET"
+
+        def resolve_site_drive(self, site_ref: str) -> tuple[str, str]:
+            return "src-site", "src-drive"
+
+        def iter_site_files(self, drive_id, since):  # type: ignore[no-untyped-def]
+            self.seen_since = since
+            self._set_cursor(f"sharepoint:{drive_id}", "DELTA-LINK-2")
+            return iter(())
+
+    sentinel = UserMapping(source_id="__sharepoint__", dest_id="")
+
+    full = FakeSite()
+    files_job.run_sharepoint_sites(
+        JobContext(user=sentinel, source=full, dest_gc=object(), mode="full", config=cfg)  # type: ignore[arg-type]
+    )
+    assert full.seen_since is None
+    with session_scope() as s:
+        assert get_cursor(s, "__sharepoint__", "sharepoint_site:src-site") == "DELTA-LINK-2"
+
+    nxt = FakeSite()
+    files_job.run_sharepoint_sites(
+        JobContext(user=sentinel, source=nxt, dest_gc=object(), mode="delta", config=cfg)  # type: ignore[arg-type]
+    )
+    assert nxt.seen_since == "DELTA-LINK-2"
+
+
+def test_sharepoint_sites_delta_skips_when_no_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from migrator.state.db import init_db
+    from migrator.workloads import files_job
+
+    init_db(tmp_path / "state.db")
+    monkeypatch.setattr(
+        files_job, "resolve_existing_site_drive", lambda gc, site: ("dest-site", "dest-drive")
+    )
+
+    cfg = Config.model_validate({
+        **_base_config({"type": "microsoft365", "tenant_id": "x", "client_id": "y"}),
+        "sharepoint_sites": [
+            {"source_site": "contoso.sharepoint.com:/sites/Eng",
+             "dest_site": "fabrikam.sharepoint.com:/sites/Eng"},
+        ],
+    })
+
+    iterated = False
+
+    class FakeSite(BaseSource):
+        capabilities = {"files"}
+
+        def resolve_site_drive(self, site_ref: str) -> tuple[str, str]:
+            return "src-site", "src-drive"
+
+        def iter_site_files(self, drive_id, since):  # type: ignore[no-untyped-def]
+            nonlocal iterated
+            iterated = True
+            return iter(())
+
+    sentinel = UserMapping(source_id="__sharepoint__", dest_id="")
+    files_job.run_sharepoint_sites(
+        JobContext(user=sentinel, source=FakeSite(), dest_gc=object(), mode="delta", config=cfg)  # type: ignore[arg-type]
+    )
+    assert iterated is False  # no seeded cursor → site skipped
+
+
+# --------------------------------------------------------------------------- #
+# Well-known mail folder mapping (system folders → real Outlook folders)
+# --------------------------------------------------------------------------- #
+def test_resolve_folder_segment_top_level_wellknown() -> None:
+    from migrator.microsoft.mail import resolve_folder_segment
+
+    assert resolve_folder_segment("Inbox", is_top_level=True) == "inbox"
+    assert resolve_folder_segment("SentItems", is_top_level=True) == "sentitems"
+    assert resolve_folder_segment("DeletedItems", is_top_level=True) == "deleteditems"
+
+
+def test_resolve_folder_segment_only_top_level() -> None:
+    from migrator.microsoft.mail import resolve_folder_segment
+
+    # A user folder literally named "Inbox" nested under another folder is custom.
+    assert resolve_folder_segment("Inbox", is_top_level=False) is None
+    # Unknown names are never well-known, even at top level.
+    assert resolve_folder_segment("Clients", is_top_level=True) is None
+
+
+# --------------------------------------------------------------------------- #
+# GraphClient header merge (caller headers override the JSON default)
+# --------------------------------------------------------------------------- #
+def test_graph_headers_merge_and_override() -> None:
+    from migrator.microsoft.graph_client import GraphClient
+
+    class _FakeTP:
+        def get_token(self) -> str:
+            return "TKN"
+
+    gc = GraphClient(token_provider=_FakeTP())  # type: ignore[arg-type]
+    base = gc._headers()
+    assert base["Authorization"] == "Bearer TKN"
+    assert base["Content-Type"] == "application/json"
+
+    merged = gc._headers({"Content-Type": "text/plain", "Content-Range": "bytes 0-9/10"})
+    assert merged["Authorization"] == "Bearer TKN"  # auth preserved
+    assert merged["Content-Type"] == "text/plain"   # caller overrides default
+    assert merged["Content-Range"] == "bytes 0-9/10"
+    gc.close()
+
+
+# --------------------------------------------------------------------------- #
+# Large MIME handling: split attachments + chunked re-upload
+# --------------------------------------------------------------------------- #
+def _build_mime_with_attachments() -> bytes:
+    from email.message import EmailMessage
+
+    em = EmailMessage()
+    em["Subject"] = "Big one"
+    em["From"] = "a@old.com"
+    em["To"] = "b@old.com"
+    em.set_content("body text")
+    # Inline part must survive stripping (cid image referenced by the body).
+    em.add_attachment(
+        b"img-bytes", maintype="image", subtype="png", cid="<logo>", disposition="inline"
+    )
+    em.add_attachment(
+        b"X" * (4 * 1024 * 1024), maintype="application", subtype="octet-stream",
+        filename="big.bin",
+    )
+    em.add_attachment(
+        b"Y" * 1000, maintype="application", subtype="octet-stream", filename="small.bin"
+    )
+    return em.as_bytes()
+
+
+def test_split_large_attachments_strips_only_attachments() -> None:
+    from migrator.microsoft.mail import _split_large_attachments
+
+    raw = _build_mime_with_attachments()
+    stripped, attachments = _split_large_attachments(raw)
+
+    names = sorted(name for name, _ct, _data in attachments)
+    assert names == ["big.bin", "small.bin"]
+    assert len(stripped) < len(raw)  # bulk attachments removed
+    # Inline image (Content-Disposition: inline) is retained, not extracted.
+    assert b"Content-ID" in stripped
+    assert b"big.bin" not in stripped and b"small.bin" not in stripped
+    big = next(data for name, _ct, data in attachments if name == "big.bin")
+    assert len(big) == 4 * 1024 * 1024
+
+
+class _RecordingGC:
+    """Captures Graph calls so import_mime_message branching can be asserted."""
+
+    def __init__(self) -> None:
+        self.posts: list[tuple[str, dict]] = []
+        self.puts: list[tuple[str, int, dict]] = []
+        self._n = 0
+
+    def post(self, path: str, user_key: str | None = None, **kw: object) -> dict:
+        self.posts.append((path, kw))
+        if path.endswith("/createUploadSession"):
+            return {"uploadUrl": "https://upload.example/session"}
+        self._n += 1
+        return {"id": f"msg-{self._n}"}
+
+    def put_raw(self, url: str, data: bytes, user_key: str | None = None, **kw: object) -> dict:
+        self.puts.append((url, len(data), kw.get("headers", {})))  # type: ignore[arg-type]
+        return {"id": "chunk"}
+
+
+def test_import_small_message_single_post() -> None:
+    from migrator.microsoft.mail import import_mime_message
+
+    gc = _RecordingGC()
+    msg_id = import_mime_message(gc, "user-1", "folder-1", b"From: a\r\n\r\nhi")  # type: ignore[arg-type]
+
+    assert msg_id == "msg-1"
+    assert len(gc.posts) == 1  # single MIME import, no attachment calls
+    assert gc.posts[0][0].endswith("/mailFolders/folder-1/messages")
+    assert gc.posts[0][1]["headers"]["Content-Type"] == "text/plain"
+    assert gc.puts == []
+
+
+def test_import_large_message_strips_and_reuploads() -> None:
+    from migrator.microsoft.mail import _ATTACHMENT_CHUNK, import_mime_message
+
+    gc = _RecordingGC()
+    raw = _build_mime_with_attachments()
+    msg_id = import_mime_message(gc, "user-1", "folder-1", raw)  # type: ignore[arg-type]
+
+    assert msg_id == "msg-1"  # returns the imported message id, not an attachment
+    paths = [p for p, _ in gc.posts]
+    # MIME import first.
+    assert paths[0].endswith("/mailFolders/folder-1/messages")
+    # Large attachment → upload session; small attachment → single POST.
+    assert any(p.endswith("/messages/msg-1/attachments/createUploadSession") for p in paths)
+    assert any(p.endswith("/messages/msg-1/attachments") for p in paths)
+
+    # Chunks cover exactly the 4 MB attachment, each within the chunk cap.
+    assert sum(size for _u, size, _h in gc.puts) == 4 * 1024 * 1024
+    assert all(size <= _ATTACHMENT_CHUNK for _u, size, _h in gc.puts)
+    assert all("Content-Range" in headers for _u, _s, headers in gc.puts)
+
+
+def test_shared_drives_delta_persists_and_reads_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from migrator.connectors.base import SharedDriveRef
+    from migrator.state.db import get_cursor, init_db, session_scope
+    from migrator.workloads import files_job
+
+    init_db(tmp_path / "state.db")
+    monkeypatch.setattr(
+        files_job, "ensure_site_for_drive",
+        lambda gc, drive_id, alias, display: ("site-1", "lib-drive-1"),
+    )
+
+    cfg = Config.model_validate({
+        **_base_config({
+            "type": "google_workspace",
+            "service_account_key_file": "k.json",
+            "admin_email": "admin@old.com",
+        }),
+        "shared_drives": [{"drive_id": "d1", "target_site_alias": "eng"}],
+    })
+
+    class FakeDrive(BaseSource):
+        capabilities = {"files"}
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen_since: object = "UNSET"
+
+        def list_shared_drives(self, user: UserMapping) -> list[SharedDriveRef]:
+            return [SharedDriveRef(drive_id="d1", name="Eng")]
+
+        def iter_shared_drive_files(self, user, drive, since=None):  # type: ignore[no-untyped-def]
+            self.seen_since = since
+            self._set_cursor(f"shared_drive:{drive.drive_id}", "PAGE-TOKEN-2")
+            return iter(())
+
+    impersonation = UserMapping(source_id="admin@old.com", dest_id="")
+
+    full = FakeDrive()
+    files_job.run_shared_drives(
+        JobContext(user=impersonation, source=full, dest_gc=object(), mode="full", config=cfg)  # type: ignore[arg-type]
+    )
+    assert full.seen_since is None
+    with session_scope() as s:
+        assert get_cursor(s, "admin@old.com", "shared_drive:d1") == "PAGE-TOKEN-2"
+
+    nxt = FakeDrive()
+    files_job.run_shared_drives(
+        JobContext(user=impersonation, source=nxt, dest_gc=object(), mode="delta", config=cfg)  # type: ignore[arg-type]
+    )
+    assert nxt.seen_since == "PAGE-TOKEN-2"
