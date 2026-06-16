@@ -65,6 +65,15 @@ def ensure_site_for_drive(
     return site_id, library_drive_id
 
 
+def resolve_existing_site_drive(gc: GraphClient, site_ref: str) -> tuple[str, str]:
+    """Resolve an existing destination SharePoint site address to
+    (site_id, default_library_drive_id). `site_ref` is a site id or a host:path
+    address like "contoso.sharepoint.com:/sites/Marketing"."""
+    site = gc.get(f"/sites/{site_ref}", params={"$select": "id"})
+    drive = gc.get(f"/sites/{site['id']}/drive", params={"$select": "id"})
+    return site["id"], drive["id"]
+
+
 def _poll_group_site(gc: GraphClient, group_id: str) -> dict[str, Any]:
     """Poll until the group's connected SharePoint site has been provisioned."""
     last_exc: Exception | None = None

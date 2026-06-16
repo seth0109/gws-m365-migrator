@@ -170,3 +170,29 @@ def test_base_source_unimplemented_raises() -> None:
     user = UserMapping(source_id="a", dest_id="b")
     with pytest.raises(NotImplementedError):
         next(src.iter_messages(user, None))
+    with pytest.raises(NotImplementedError):
+        src.resolve_site_drive("contoso.sharepoint.com:/sites/X")
+
+
+def test_sharepoint_sites_config_parses() -> None:
+    cfg = Config.model_validate({
+        **_base_config({"type": "microsoft365", "tenant_id": "x", "client_id": "y"}),
+        "sharepoint_sites": [
+            {"source_site": "contoso.sharepoint.com:/sites/Marketing",
+             "dest_site": "fabrikam.sharepoint.com:/sites/Marketing"},
+            {"source_site": "contoso.sharepoint.com:/sites/Eng",
+             "target_site_alias": "eng"},
+        ],
+    })
+    assert len(cfg.sharepoint_sites) == 2
+    assert cfg.sharepoint_sites[0].dest_site == "fabrikam.sharepoint.com:/sites/Marketing"
+    assert cfg.sharepoint_sites[1].target_site_alias == "eng"
+    assert cfg.sharepoint_sites[1].dest_site is None
+
+
+def test_sourcefile_carries_drive_root() -> None:
+    from migrator.connectors.base import SourceFile
+
+    f = SourceFile(source_id="1", name="x", mime_type="", parent_id=None, is_folder=False,
+                   drive_root="drives/abc")
+    assert f.drive_root == "drives/abc"

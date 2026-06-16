@@ -114,6 +114,23 @@ class Orchestrator:
             )
             job(ctx)
 
+    def run_sharepoint_sites(self) -> None:
+        """Migrate configured SharePoint sites between M365 tenants (tenant-level)."""
+        from .workloads.files_job import run_sharepoint_sites as job
+
+        if not isinstance(self.config.source, Microsoft365SourceConfig):
+            raise RuntimeError("sharepoint site migration requires a microsoft365 source")
+        if not self.config.sharepoint_sites:
+            log.warning("No sharepoint_sites configured — nothing to do")
+            return
+        # State for site libraries is namespaced by source site id, not a user.
+        sentinel = UserMapping(source_id="__sharepoint__", dest_id="")
+        with self._build_source() as source, self.dest_graph_client() as gc:
+            ctx = JobContext(
+                user=sentinel, source=source, dest_gc=gc, mode="full", config=self.config
+            )
+            job(ctx)
+
     def run_workload(
         self,
         workload_name: str,

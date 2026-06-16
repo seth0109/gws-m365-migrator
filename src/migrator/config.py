@@ -104,6 +104,21 @@ class SharedDriveMapping(BaseModel):
     display_name: str | None = None  # site display name; defaults to drive_name
 
 
+class SharePointSiteMapping(BaseModel):
+    """A source SharePoint site → destination site (microsoft365 source only).
+
+    `source_site` is a Graph site address: a site id, or a host:path form such as
+    "contoso.sharepoint.com:/sites/Marketing". The destination is either an
+    existing site (`dest_site`, same address forms) or auto-provisioned from
+    `target_site_alias` (mailNickname). Provide exactly one of the two.
+    """
+
+    source_site: str
+    dest_site: str | None = None
+    target_site_alias: str | None = None
+    display_name: str | None = None  # provisioned site display name; defaults to alias
+
+
 # --------------------------------------------------------------------------- #
 # Workloads + rate limits (unchanged shapes)
 # --------------------------------------------------------------------------- #
@@ -141,6 +156,7 @@ class Config(BaseModel):
     destination: DestinationConfig
     users: list[UserMapping]
     shared_drives: list[SharedDriveMapping] = Field(default_factory=list)
+    sharepoint_sites: list[SharePointSiteMapping] = Field(default_factory=list)
     workloads: WorkloadsConfig = Field(default_factory=WorkloadsConfig)
     rate_limits: RateLimitsConfig = Field(default_factory=RateLimitsConfig)
 

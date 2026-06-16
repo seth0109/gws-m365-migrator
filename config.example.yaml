@@ -95,4 +95,12 @@ rate_limits:
 #      certificate_path: credentials/source-ms-cert.pem
 #      certificate_thumbprint: "112233445566..."
 #      token_cache_file: .ms_source_token_cache.json
+#
+#    # SharePoint site → site (microsoft365 source only); used by `migrator sharepoint`.
+#    # Give each source site a dest_site (existing) OR target_site_alias (auto-provision).
+#    sharepoint_sites:
+#      - source_site: "contoso.sharepoint.com:/sites/Marketing"
+#        dest_site:   "fabrikam.sharepoint.com:/sites/Marketing"   # existing dest site
+#      - source_site: "contoso.sharepoint.com:/sites/Engineering"
+#        target_site_alias: "engineering"                          # auto-provision dest site
 # ─────────────────────────────────────────────────────────────────────────────

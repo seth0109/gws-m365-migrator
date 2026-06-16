@@ -124,6 +124,18 @@ def shared_drives(
     orch.run_shared_drives()
 
 
+@app.command()
+def sharepoint(
+    config: Annotated[Path, _CONFIG_OPT] = Path("config.yaml"),
+) -> None:
+    """Migrate SharePoint sites between Microsoft 365 tenants (microsoft365 source)."""
+    orch = _build_orchestrator(config)
+    if orch.config.source.type != "microsoft365":
+        console.print("[red]sharepoint is only available for a microsoft365 source.")
+        raise typer.Exit(1)
+    orch.run_sharepoint_sites()
+
+
 @app.command("run-all")
 def run_all(
     config: Annotated[Path, _CONFIG_OPT] = Path("config.yaml"),

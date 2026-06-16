@@ -156,9 +156,14 @@ if (cursor := ctx.source.get_last_cursor("contacts")):
 
 Per-job config arrives via `ctx.config` (and `ctx.source`/`ctx.dest_gc`) — see Job Execution Model. The package-level `_pkg._current_config` / `_pkg._current_manifest` globals remain: `_current_config` is set by the Orchestrator in `__init__()`, and whatif jobs read `_current_manifest` (set by the `whatif` CLI command) to record planned items.
 
-### Shared Drives → SharePoint (tenant-level)
+### SharePoint migrations (tenant-level, not per-user)
 
-`migrator shared-drives` is **not** per-user. `Orchestrator.run_shared_drives()` builds one source + one destination client, impersonates the Workspace `admin_email` to enumerate/download Drive content, and for each configured `shared_drives` mapping calls `microsoft/sharepoint.py:ensure_site_for_drive()` — which provisions a connected M365 group/team site (`POST /groups`, polls `/groups/{id}/sites/root`), resolves its default document-library drive, and records the mapping in `FolderMap` (`workload="sharepoint_site"`) for idempotent reuse. Files then upload through the shared `microsoft/files.py` writers with `drive_root=f"drives/{library_drive_id}"`. State for each drive is namespaced under `workload=f"shared_drive:{drive_id}"`. Requires `Group.ReadWrite.All` + `Sites.*` on the destination app.
+Two SharePoint flows exist; both bypass the per-user `run_workload` path and instead use a dedicated `Orchestrator` method that builds one source + one destination client and a sentinel `JobContext`. Both upload through the shared `microsoft/files.py` writers with `drive_root=f"drives/{dest_drive_id}"` and namespace state by source id (`shared_drive:<id>` / `sharepoint_site:<id>`).
+
+- **`migrator shared-drives`** (google_workspace source) — `Orchestrator.run_shared_drives()` impersonates the Workspace `admin_email` to enumerate/download Drive content, and for each `shared_drives` mapping calls `microsoft/sharepoint.py:ensure_site_for_drive()` — provisions a connected M365 group/team site (`POST /groups`, polls `/groups/{id}/sites/root`), resolves its default document library, and records it in `FolderMap` (`workload="sharepoint_site"`) for idempotent reuse.
+- **`migrator sharepoint`** (microsoft365 source) — `Orchestrator.run_sharepoint_sites()` migrates SharePoint libraries tenant-to-tenant. `M365Source.resolve_site_drive()` resolves the source site's library drive; the destination is an existing `dest_site` (`resolve_existing_site_drive()`) or an auto-provisioned `target_site_alias` (reusing `ensure_site_for_drive()`).
+
+`M365Source` file reads are **drive-generic**: `_iter_drive(drive_root, …)` walks any drive's delta feed and stamps `SourceFile.drive_root` so `fetch_file()` reads content from the right drive (OneDrive `users/<id>/drive` or SharePoint `drives/<id>`). Both flows require `Group.ReadWrite.All` + `Sites.*` on the destination app (only auto-provisioning needs `Group.ReadWrite.All`).
 
 ### Workload Structure
 

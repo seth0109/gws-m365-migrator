@@ -13,7 +13,7 @@ from ..microsoft.files import (
     upload_small_file,
 )
 from ..microsoft.graph_client import GraphClient
-from ..microsoft.sharepoint import ensure_site_for_drive
+from ..microsoft.sharepoint import ensure_site_for_drive, resolve_existing_site_drive
 from ..state.db import (
     get_cursor,
     get_item_hash,
@@ -106,6 +106,42 @@ def run_shared_drives(ctx: JobContext) -> None:
             _process_file(
                 ctx, gc, drive_root, library_drive_id, f, folder_id_cache, workload=workload
             )
+
+
+def run_sharepoint_sites(ctx: JobContext) -> None:
+    """Migrate SharePoint document libraries between Microsoft 365 tenants. Each
+    configured source site maps to an existing destination site (`dest_site`) or
+    an auto-provisioned one (`target_site_alias`). Tenant-level."""
+    if ctx.config.source.type != "microsoft365":
+        raise RuntimeError("sharepoint site migration requires a microsoft365 source")
+    ctx.require_capability("files")
+
+    gc = ctx.dest_gc
+    assert gc is not None, "GraphClient required outside whatif mode"
+
+    for mapping in ctx.config.sharepoint_sites:
+        source_site_id, source_drive_id = ctx.source.resolve_site_drive(mapping.source_site)
+
+        if mapping.dest_site:
+            _, dest_drive_id = resolve_existing_site_drive(gc, mapping.dest_site)
+        elif mapping.target_site_alias:
+            display = mapping.display_name or mapping.target_site_alias
+            _, dest_drive_id = ensure_site_for_drive(
+                gc, source_site_id, mapping.target_site_alias, display
+            )
+        else:
+            log.warning(
+                "sharepoint_sites entry %s has neither dest_site nor target_site_alias — skipping",
+                mapping.source_site,
+            )
+            continue
+
+        log.info("SharePoint %s → dest drive %s", mapping.source_site, dest_drive_id)
+        drive_root = f"drives/{dest_drive_id}"
+        workload = f"sharepoint_site:{source_site_id}"
+        folder_id_cache: dict[str, str] = {}
+        for f in ctx.source.iter_site_files(source_drive_id, None):
+            _process_file(ctx, gc, drive_root, dest_drive_id, f, folder_id_cache, workload=workload)
 
 
 def _process_file(

@@ -140,29 +140,41 @@ class M365Source(BaseSource):
                 sender=sender,
             )
 
-    # -- files (OneDrive) --------------------------------------------------- #
-    def iter_files(self, user: UserMapping, since: str | None) -> Iterator[SourceFile]:
-        uid = self._uid(user)
-        if since:
-            path = _strip_base(since)
-        else:
-            path = f"/users/{uid}/drive/root/delta"
+    # -- files (OneDrive + SharePoint, drive-generic) ----------------------- #
+    def _iter_drive(
+        self, drive_root: str, user_key: str, cursor_key: str, since: str | None
+    ) -> Iterator[SourceFile]:
+        """Walk a drive's delta feed. `drive_root` is the Graph prefix to the drive
+        (e.g. "users/<id>/drive" or "drives/<id>"); it is stamped on each SourceFile
+        so fetch_file knows where to read content from."""
         gc = self._client()
-        url: str | None = path
+        url: str | None = _strip_base(since) if since else f"/{drive_root}/root/delta"
         delta_link: str | None = None
         while url:
-            data = gc.get(url, user_key=uid)
+            data = gc.get(url, user_key=user_key)
             for item in data.get("value", []):
                 if "root" in item:
                     continue  # skip the drive root pseudo-item
-                yield self._to_file(item)
+                yield self._to_file(item, drive_root)
             next_link = data.get("@odata.nextLink")
             delta_link = data.get("@odata.deltaLink") or delta_link
             url = _strip_base(next_link) if next_link else None
         if delta_link:
-            self._set_cursor("files", delta_link)
+            self._set_cursor(cursor_key, delta_link)
 
-    def _to_file(self, item: dict[str, Any]) -> SourceFile:
+    def iter_files(self, user: UserMapping, since: str | None) -> Iterator[SourceFile]:
+        uid = self._uid(user)
+        yield from self._iter_drive(f"users/{uid}/drive", uid, "files", since)
+
+    def iter_site_files(self, drive_id: str, since: str | None) -> Iterator[SourceFile]:
+        yield from self._iter_drive(f"drives/{drive_id}", drive_id, f"sharepoint:{drive_id}", since)
+
+    def resolve_site_drive(self, site_ref: str) -> tuple[str, str]:
+        site = self._client().get(f"/sites/{site_ref}", params={"$select": "id"})
+        drive = self._client().get(f"/sites/{site['id']}/drive", params={"$select": "id"})
+        return site["id"], drive["id"]
+
+    def _to_file(self, item: dict[str, Any], drive_root: str) -> SourceFile:
         is_folder = "folder" in item
         parent = (item.get("parentReference", {}) or {}).get("id")
         file_info = item.get("file", {}) or {}
@@ -177,12 +189,13 @@ class M365Source(BaseSource):
             modified_time=item.get("lastModifiedDateTime", ""),
             content_hash=content_hash,
             action="create-folder" if is_folder else "migrate",
+            drive_root=drive_root,
         )
 
     def fetch_file(self, user: UserMapping, f: SourceFile) -> tuple[bytes, str]:
-        uid = self._uid(user)
+        drive_root = f.drive_root or f"users/{self._uid(user)}/drive"
         content = self._client().get_bytes(
-            f"/users/{uid}/drive/items/{f.source_id}/content", user_key=uid
+            f"/{drive_root}/items/{f.source_id}/content", user_key=drive_root
         )
         return content, f.name
 

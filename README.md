@@ -4,7 +4,7 @@ A Python CLI tool that migrates email, files, contacts, and calendars into **Mic
 
 - **Google Workspace** → M365 (Gmail, Drive, Contacts, Calendar; plus Shared Drives → SharePoint)
 - **IMAP / generic SMTP mail servers** → M365 (mail)
-- **Microsoft 365 → Microsoft 365** tenant-to-tenant (mail, OneDrive, contacts, calendar)
+- **Microsoft 365 → Microsoft 365** tenant-to-tenant (mail, OneDrive, SharePoint sites, contacts, calendar)
 
 Designed for a big-bang weekend cutover with a post-cutover delta sync. The pipeline is **resumable**, **idempotent**, and **re-runnable** — every item records a source→destination mapping in a local SQLite state store, so an interrupted run picks back up exactly where it stopped.
 
@@ -108,6 +108,14 @@ migrator shared-drives --config config.yaml
 ```
 
 For each entry in `shared_drives[]`, auto-provisions a connected SharePoint site (idempotent — reused on re-runs) and copies the Drive's contents into its document library.
+
+### SharePoint site → site (microsoft365 source)
+
+```bash
+migrator sharepoint --config config.yaml
+```
+
+For each entry in `sharepoint_sites[]`, copies a source-tenant SharePoint document library into the destination tenant — either an existing `dest_site` or an auto-provisioned `target_site_alias`.
 
 ### Migrate everything
 

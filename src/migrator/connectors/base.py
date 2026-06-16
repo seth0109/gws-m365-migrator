@@ -49,6 +49,7 @@ class SourceFile:
     export_ext: str | None = None  # appended to name when action == "export"
     notes: str = ""
     source_path: str = ""  # human-readable path, for inventory only
+    drive_root: str = ""  # connector-internal: which source drive to fetch content from
 
 
 @dataclass
@@ -146,6 +147,14 @@ class BaseSource:
     def iter_shared_drive_files(
         self, user: UserMapping, drive: SharedDriveRef
     ) -> Iterator[SourceFile]:
+        raise NotImplementedError
+
+    def resolve_site_drive(self, site_ref: str) -> tuple[str, str]:
+        """Resolve a SharePoint site address to (site_id, default_library_drive_id)."""
+        raise NotImplementedError
+
+    def iter_site_files(self, drive_id: str, since: str | None) -> Iterator[SourceFile]:
+        """Iterate files in a SharePoint document-library drive."""
         raise NotImplementedError
 
     # -- contacts ----------------------------------------------------------- #
