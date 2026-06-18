@@ -2,43 +2,68 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import func, select
 
 from .config import Config
 from .state.db import init_db, session_scope
-from .state.models import ItemMap, JobRun
+from .state.models import ItemMap
 
 log = logging.getLogger(__name__)
+
+# Per-user workloads we expect for every configured user. Listing one with zero
+# rows is itself a signal (workload never ran / nothing enumerated), so these are
+# always shown even when no ItemMap rows exist. Tenant-level workloads
+# (shared_drive:*, sharepoint_site:*) are namespaced and keyed by an
+# impersonation/sentinel id rather than a configured user, so those are
+# discovered from the DB instead of assumed.
+_STANDARD_WORKLOADS = ("contacts", "calendar", "files", "mail")
 
 
 def generate_report(cfg: Config, output_path: Path) -> None:
     init_db(cfg.state_db)
 
-    rows: list[dict] = []
+    rows: list[dict[str, Any]] = []
     with session_scope() as s:
-        for user in cfg.users:
-            for workload in ("contacts", "calendar", "files", "mail"):
-                counts = s.execute(
-                    select(ItemMap.status, func.count(ItemMap.id))
-                    .where(
-                        ItemMap.user_email == user.google_email,
-                        ItemMap.workload == workload,
-                    )
-                    .group_by(ItemMap.status)
-                ).all()
+        # Every (user, workload) pair that actually has state, so namespaced
+        # tenant-level workloads (shared_drive:<id> / sharepoint_site:<id>) and
+        # any user not in the config are included rather than silently dropped.
+        observed = {
+            (user_email, workload)
+            for user_email, workload in s.execute(
+                select(ItemMap.user_email, ItemMap.workload).distinct()
+            ).all()
+        }
+        # Union with the standard per-user workloads so a configured user whose
+        # workload produced no rows still surfaces (a possible data-loss signal).
+        expected = {
+            (user.source_id, workload)
+            for user in cfg.users
+            for workload in _STANDARD_WORKLOADS
+        }
 
-                status_map = {status: count for status, count in counts}
-                rows.append({
-                    "user": user.google_email,
-                    "workload": workload,
-                    "done": status_map.get("done", 0),
-                    "failed": status_map.get("failed", 0),
-                    "skipped": status_map.get("skipped", 0),
-                    "pending": status_map.get("pending", 0),
-                })
+        for user_email, workload in sorted(observed | expected):
+            counts = s.execute(
+                select(ItemMap.status, func.count(ItemMap.id))
+                .where(
+                    ItemMap.user_email == user_email,
+                    ItemMap.workload == workload,
+                )
+                .group_by(ItemMap.status)
+            ).all()
 
-        failures: list[dict] = []
+            status_map = {status: count for status, count in counts}
+            rows.append({
+                "user": user_email,
+                "workload": workload,
+                "done": status_map.get("done", 0),
+                "failed": status_map.get("failed", 0),
+                "skipped": status_map.get("skipped", 0),
+                "pending": status_map.get("pending", 0),
+            })
+
+        failures: list[dict[str, Any]] = []
         fail_rows = s.execute(
             select(ItemMap)
             .where(ItemMap.status == "failed")
@@ -56,8 +81,8 @@ def generate_report(cfg: Config, output_path: Path) -> None:
 
 
 def _write_html(
-    rows: list[dict],
-    failures: list[dict],
+    rows: list[dict[str, Any]],
+    failures: list[dict[str, Any]],
     output_path: Path,
 ) -> None:
     html_rows = "\n".join(

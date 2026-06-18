@@ -1,42 +1,46 @@
-# gws-m365-migrator
+# m365-migrator
 
-A Python CLI tool that migrates email, files, contacts, and calendars from **Google Workspace** to **Microsoft 365** for small tenants (<50 users).
+A Python CLI tool that migrates email, files, contacts, and calendars into **Microsoft 365** from multiple sources, for small tenants (<50 users):
+
+- **Google Workspace** → M365 (Gmail, Drive, Contacts, Calendar; plus Shared Drives → SharePoint)
+- **IMAP / generic SMTP mail servers** → M365 (mail)
+- **Microsoft 365 → Microsoft 365** tenant-to-tenant (mail, OneDrive, SharePoint sites, contacts, calendar)
 
 Designed for a big-bang weekend cutover with a post-cutover delta sync. The pipeline is **resumable**, **idempotent**, and **re-runnable** — every item records a source→destination mapping in a local SQLite state store, so an interrupted run picks back up exactly where it stopped.
 
-> **Safety invariant:** all Google scopes are `.readonly`. The tool never writes back to Google.
+> **Safety invariant:** sources are read-only. The tool never writes back to the source (Google scopes are `.readonly`, IMAP is read-only, the M365 source tenant is only read).
 
 ---
 
 ## Architecture
 
 ```
-   Google APIs (read-only)          Microsoft Graph (write)
-   Gmail / Drive / People / Cal     Mail / Files / Contacts / Cal
-            │                                  ▲
-            └──────► Transform layer ──────────┘
+   Source connector (read-only)          Microsoft Graph (write)
+   Google / IMAP / M365-tenant   ──►      Mail / Files / Contacts / Cal
+            │                                       ▲
+            └────────► Transform / normalize ───────┘
                             │
                   SQLite state store
               (id maps · cursors · job log)
 ```
 
-- **Extract** from Google APIs via service account + domain-wide delegation.
-- **Transform** Google data models to Graph equivalents (folder/label structure preserved).
-- **Load** into Microsoft Graph via `httpx` with tenacity-backed retries and a three-layer rate limiter (global + per-mailbox).
+- **Source connectors** (`src/migrator/connectors/`) abstract the source behind per-workload methods that emit destination-ready items (raw MIME for mail, Graph-shaped bodies for contacts/events). Pick one via the `source.type` config: `google_workspace`, `imap`, or `microsoft365`.
+- **Destination** is always Microsoft Graph (`httpx` + tenacity retries + a three-layer rate limiter). Personal files go to OneDrive; Google Shared Drives auto-provision SharePoint sites.
 - **Persist** every item's source-ID → destination-ID mapping plus per-workload sync cursors so the delta pass is cheap.
 
-Each workload (contacts, calendar, files, mail) runs in its own thread pool with isolated state and configurable concurrency.
+Each workload (contacts, calendar, files, mail) runs in its own thread pool with isolated state and configurable concurrency. Commands skip workloads the configured source doesn't support (e.g. an IMAP source only does `mail`).
 
 ---
 
 ## Prerequisites
 
 - Python 3.11+
-- A **Google Workspace service account** with domain-wide delegation enabled and the four read-only scopes authorized (gmail, drive, contacts, calendar)
-- A **Microsoft Entra app registration** in the target tenant with application permissions for Mail, Files, Contacts, and Calendars (Graph) — certificate auth preferred over client secrets
-- Admin consent granted on both sides
-
-See `project_plan.md` (Phase 0) for the full access-setup checklist.
+- A **destination Microsoft Entra app registration** with Graph application permissions for Mail, Files, Contacts, and Calendars — certificate auth preferred over client secrets. For `shared-drives` (SharePoint auto-provisioning) also grant `Group.ReadWrite.All` + `Sites.ReadWrite.All`.
+- Source-specific access, depending on `source.type`:
+  - **google_workspace** — a service account with domain-wide delegation and the four `.readonly` scopes (gmail, drive, contacts, calendar)
+  - **imap** — per-user IMAP credentials (username + password/app-password)
+  - **microsoft365** — a Graph app registration in the **source** tenant with read permissions for the workloads being migrated
+- Admin consent granted on every side in use.
 
 ---
 
@@ -44,29 +48,62 @@ See `project_plan.md` (Phase 0) for the full access-setup checklist.
 
 ```bash
 # 1. Clone and enter the project
-cd gws-m365-migrator
+cd m365-migrator
 
 # 2. Install in editable mode with dev extras
 pip install -e ".[dev]"
 
-# 3. Copy and edit the example config
+# 3a. Generate a config from your credentials + a user-mapping CSV (recommended)
+migrator init-config --type google_workspace \
+  --tenant-id <dest-tenant> --client-id <dest-app> --thumbprint <dest-cert-thumbprint> \
+  --admin-email admin@yourdomain.com --mapping users.csv
+
+# 3b. ...or copy and hand-edit the example
 cp config.example.yaml config.yaml
 ```
 
-Place credentials under `credentials/`:
+Place credentials under `credentials/` (e.g. `google-service-account.json`, `ms-cert.pem`).
 
+### Scaffold a config (`init-config`)
+
+`migrator init-config` writes a validated `config.yaml` for you. It discovers the
+service-account JSON and certificate PEM(s) in `--credentials-dir` (default
+`credentials/`), reads user mappings from a CSV, and fills in the rest:
+
+```bash
+# Google Workspace source
+migrator init-config -t google_workspace \
+  --tenant-id <dest-tenant> --client-id <dest-app> --thumbprint <dest-thumbprint> \
+  --admin-email admin@yourdomain.com -m users.csv
+
+# IMAP source
+migrator init-config -t imap \
+  --tenant-id <dest-tenant> --client-id <dest-app> --thumbprint <dest-thumbprint> \
+  --imap-host imap.example.com -m users.csv
+
+# Microsoft 365 → Microsoft 365 (needs a second, source-tenant certificate)
+migrator init-config -t microsoft365 \
+  --tenant-id <dest-tenant> --client-id <dest-app> --thumbprint <dest-thumbprint> \
+  --source-tenant-id <src-tenant> --source-client-id <src-app> --source-thumbprint <src-thumbprint> \
+  -m users.csv
 ```
-credentials/
-├── google-service-account.json   # downloaded from GCP
-└── ms-cert.pem                   # uploaded to the Entra app
-```
 
-Edit `config.yaml`:
+- **Credential discovery** — a lone `*.json` becomes the Google service-account key; a
+  lone `*.pem` becomes the destination certificate. A `microsoft365` source needs two
+  PEMs, disambiguated by filename keyword (`source*` vs `dest*`). Resolve any ambiguity
+  with `--service-account-key`, `--cert`, and `--source-cert`.
+- **Mapping CSV** (`-m/--mapping`) — headers `source_id,dest_id` (aliases like `from`/`to`
+  accepted), plus optional `imap_user,imap_password_env`. Omit `--mapping` to emit a
+  placeholder `users[]` entry to fill in by hand.
+- Writes to `config.yaml` by default (`-o` to change); refuses to clobber an existing file
+  unless you pass `--force`.
 
-- `google.admin_email` — a Workspace super-admin (used for impersonation)
-- `microsoft.tenant_id` / `client_id` — from the Entra app registration
-- `microsoft.certificate_thumbprint` — the thumbprint of the cert uploaded to Entra
-- `users[]` — one entry per user, mapping `google_email` → `ms_upn`
+Edit the result (see `config.example.yaml` for all three source blocks):
+
+- `source:` — pick **one** `type` (`google_workspace` | `imap` | `microsoft365`) and fill its fields
+- `destination:` — `tenant_id` / `client_id` / cert thumbprint (or `client_secret`) from the destination Entra app
+- `users[]` — one entry per user, mapping `source_id` → `dest_id`. For an `imap` source also set `imap_user` + `imap_password_env` (the env var holding the password)
+- `shared_drives[]` — (google_workspace only) Shared Drives to move to SharePoint, each with a `target_site_alias`
 - `workloads.*.concurrency` — tune per workload (defaults are sensible)
 - `rate_limits.*` — adjust if you hit throttling
 
@@ -74,7 +111,7 @@ Edit `config.yaml`:
 
 ## Usage
 
-All commands take `--config / -c` (default `config.yaml`) and accept `--user / -u <email>` to scope a run to a single user.
+All commands take `--config / -c` (default `config.yaml`) and accept `--user / -u <source_id>` to scope a run to a single user. Per-workload commands and `run-all`/`delta`/`whatif` automatically skip workloads the configured source can't do (an `imap` source supports only `mail`).
 
 ### Dry-run inventory (whatif)
 
@@ -82,9 +119,9 @@ All commands take `--config / -c` (default `config.yaml`) and accept `--user / -
 migrator whatif --config config.yaml --output whatif_manifest.csv
 ```
 
-Enumerates every contact, calendar event, Drive file, and Gmail message that *would* be migrated for each configured user, and writes a single CSV manifest. Does **not** connect to Microsoft Graph — useful for pre-cutover sizing, change-management approval, and verifying user mappings before any destination side is set up. Add `--user alice@yourdomain.com` to scope to one user.
+Enumerates every item that *would* be migrated for each configured user (across the supported workloads) and writes a single CSV manifest. Does **not** connect to the destination — useful for pre-cutover sizing, change-management approval, and verifying user mappings. Add `--user alice@yourdomain.com` to scope to one user.
 
-CSV columns: `timestamp, user_email, ms_upn, workload, source_id, source_path, name, size_bytes, mime_type, modified_time, action, notes`.
+CSV columns: `timestamp, source_user, dest_user, workload, source_id, source_path, name, size_bytes, mime_type, modified_time, action, notes`.
 
 ### Validate access (run this first)
 
@@ -92,16 +129,32 @@ CSV columns: `timestamp, user_email, ms_upn, workload, source_id, source_path, n
 migrator smoke-test --config config.yaml
 ```
 
-Reads Gmail labels for the first user in `config.yaml`, then creates and deletes a test folder in their Microsoft mailbox. Confirms both sides are wired up before you touch real data.
+Probes the configured source (Gmail labels / IMAP login / source-tenant Graph read) for the first user, then creates and deletes a test folder in their destination mailbox. Confirms both sides are wired up before you touch real data.
 
 ### Migrate one workload
 
 ```bash
 migrator contacts --config config.yaml
 migrator calendar --config config.yaml
-migrator files    --config config.yaml
+migrator files    --config config.yaml   # personal files → OneDrive
 migrator mail     --config config.yaml
 ```
+
+### Shared Drives → SharePoint (google_workspace source)
+
+```bash
+migrator shared-drives --config config.yaml
+```
+
+For each entry in `shared_drives[]`, auto-provisions a connected SharePoint site (idempotent — reused on re-runs) and copies the Drive's contents into its document library.
+
+### SharePoint site → site (microsoft365 source)
+
+```bash
+migrator sharepoint --config config.yaml
+```
+
+For each entry in `sharepoint_sites[]`, copies a source-tenant SharePoint document library into the destination tenant — either an existing `dest_site` or an auto-provisioned `target_site_alias`.
 
 ### Migrate everything
 
@@ -109,7 +162,7 @@ migrator mail     --config config.yaml
 migrator run-all --config config.yaml
 ```
 
-Runs all *enabled* workloads sequentially: contacts → calendar → files → mail.
+Runs all *enabled and source-supported* workloads sequentially: contacts → calendar → files → mail.
 
 ### Delta sync (post-cutover)
 
@@ -160,21 +213,23 @@ Line length is 100. Source root is `src/`.
 ## Project layout
 
 ```
-gws-m365-migrator/
+m365-migrator/
 ├── pyproject.toml
 ├── config.example.yaml
 ├── src/migrator/
 │   ├── cli.py              # typer entrypoints
-│   ├── config.py           # pydantic config models
-│   ├── orchestrator.py     # thread-pool dispatch, config injection
+│   ├── config.py           # pydantic config models (source/destination)
+│   ├── context.py          # JobContext (user + source + dest passed to jobs)
+│   ├── orchestrator.py     # thread-pool dispatch, source/dest client wiring
 │   ├── ratelimit.py        # token-bucket rate limiters
 │   ├── reporting.py        # validation report
-│   ├── auth/               # google + ms auth
-│   ├── google/             # read-only google connectors
-│   ├── microsoft/          # graph client + writers
+│   ├── connectors/         # source connectors: base, google, imap, m365, factory
+│   ├── auth/               # google + ms auth (MSTokenProvider used for both tenants)
+│   ├── google/             # read-only google API wrappers
+│   ├── microsoft/          # graph client + destination writers + sharepoint provisioning
 │   ├── transform/          # data-model mapping
 │   ├── state/              # sqlalchemy models + session
-│   └── workloads/          # contacts / calendar / files / mail jobs
+│   └── workloads/          # contacts / calendar / files / mail jobs (source-agnostic)
 └── tests/
 ```
 

@@ -16,7 +16,7 @@ pytest                          # Run all tests
 pytest tests/ -v               # Verbose output
 pytest tests/test_foo.py -k test_name  # Single test
 ```
-pytest configured in pyproject.toml with testpaths=["tests"]; currently tests/ is mostly empty.
+pytest configured in pyproject.toml with testpaths=["tests"]. `tests/test_multi_source.py` covers the pure (no-network) logic: config discrimination, source factory dispatch, capability gating, IMAP folder mapping, and manifest columns.
 
 ### Linting & Formatting
 ```bash
@@ -34,27 +34,36 @@ Strict mode enabled (strict = true). Python 3.11+.
 ### Run the CLI Tool
 ```bash
 migrator --help                              # Show all commands
+migrator init-config --type <src> --tenant-id .. --client-id .. --thumbprint .. -m users.csv  # Scaffold config.yaml from credentials/ + mapping CSV
 migrator contacts --config config.yaml      # Migrate contacts
 migrator calendar --config config.yaml      # Migrate calendar
-migrator files --config config.yaml         # Migrate Drive → OneDrive
-migrator mail --config config.yaml          # Migrate Gmail → Outlook
-migrator run-all --config config.yaml       # Run all enabled workloads sequentially
-migrator delta --config config.yaml         # Delta sync (post-cutover) using stored cursors
+migrator files --config config.yaml         # Migrate personal files → OneDrive
+migrator mail --config config.yaml          # Migrate mail (Gmail / IMAP / M365 source) → Outlook
+migrator shared-drives --config config.yaml # Google Shared Drives → SharePoint (auto-provision sites); --delta for changed-only
+migrator sharepoint --config config.yaml    # M365 SharePoint sites → M365 (tenant-to-tenant); --delta for changed-only
+migrator run-all --config config.yaml       # Run all enabled + source-supported workloads sequentially
+migrator delta --config config.yaml         # Delta sync (post-cutover) using stored cursors (per-user workloads)
 migrator whatif --config config.yaml --output whatif_manifest.csv  # Dry-run inventory CSV
-migrator smoke-test --config config.yaml    # Phase 0 test: read Gmail labels, write test folder to MS
+migrator smoke-test --config config.yaml    # Phase 0 test: probe source, write+delete a dest test folder
 migrator validate --config config.yaml --output report.html  # Generate validation report
 ```
-Use `--user user@domain.com` to limit any run to a single user. Config is YAML with Google service account, Microsoft tenant/client, user mappings, workload settings, and rate limits.
+Use `--user <source_id>` to limit any run to a single user. Per-workload commands and `run-all`/`delta`/`whatif` skip (or error on) workloads the configured source does not support — see Source Connectors. Config is YAML with a `source:` block (type `google_workspace` | `imap` | `microsoft365`), a `destination:` Microsoft 365 block, user mappings (`source_id` → `dest_id`), optional `shared_drives`, workload settings, and rate limits. See `config.example.yaml`.
 
 ## Architecture
 
-### Configuration Flow
+### Source/Destination model (the core abstraction)
 
-1. **YAML → Config model**: `load_config(path)` parses YAML and validates using Pydantic v2 models (GoogleConfig, MicrosoftConfig, WorkloadsConfig, RateLimitsConfig).
-2. **Orchestrator singleton**: Receives Config in `__init__()`, stores as `self.config`.
-3. **Global injection**: `migrator._current_config = config` set by Orchestrator before dispatching any job. Jobs import `migrator` and read `migrator._current_config` to access config. This avoids passing config through deeply nested function calls.
+The tool migrates from a pluggable **source** to a Microsoft 365 **destination**. The source is generalized behind connector classes (`src/migrator/connectors/`); the destination is always Microsoft Graph. This is what lets the same workload jobs serve Google Workspace, generic IMAP, and tenant-to-tenant M365 migrations.
 
-**Why this pattern:** Workload jobs are called with signature `fn(user: UserMapping, gc: GraphClient, mode: str)`. Config cannot be threaded through without changing the interface. Global injection keeps job signatures clean.
+- **Config**: `load_config(path)` validates a Pydantic v2 `Config` with a discriminated `source` union (`GoogleWorkspaceSourceConfig` | `ImapSourceConfig` | `Microsoft365SourceConfig`, discriminated on `type`) and a `Microsoft365DestinationConfig`. `UserMapping` is identity-neutral: `source_id` → `dest_id` (plus optional `imap_user`/`imap_password_env`). `GoogleConfig` is kept as a backwards-compat alias of `GoogleWorkspaceSourceConfig` so the untouched `google/*` connectors still type-check.
+- **Source connectors** (`connectors/base.py`): each concrete source subclasses `BaseSource`, advertises a `capabilities` set, and emits **destination-ready** normalized items (`SourceMessage` carries raw RFC822 MIME + folder placement + flags; `SourceContact`/`SourceEvent` carry ready-to-POST Graph bodies; `SourceFile` carries metadata + a lazy `fetch_file`). `connectors/factory.py:build_source()` dispatches on `source.type`; `source_capabilities()` answers gating questions without constructing network clients.
+- **JobContext** (`context.py`): replaces the old global-config injection for per-job data. The Orchestrator builds `JobContext(user, source, dest_gc, mode, config)` per user and calls `fn(ctx)`. `ctx.require_capability(workload)` raises if the source can't do that workload. (`_current_config`/`_current_manifest` globals remain only for whatif manifest access.)
+
+**Key leverage:** every mail source emits raw MIME and `microsoft/files.py` takes a `drive_root` prefix — so the destination writers (`microsoft/{mail,files,contacts,calendar}.py`) are shared unchanged across all source types and across OneDrive vs SharePoint.
+
+### Config Scaffolding (`init-config`)
+
+`src/migrator/configgen.py` holds the pure, network-free logic behind the `init-config` CLI command: `discover_credentials()` resolves the service-account JSON / certificate PEM(s) in a `credentials/` folder (a `microsoft365` source needs two PEMs, disambiguated by `source*`/`dest*` filename keyword); `parse_mapping_csv()` reads `source_id,dest_id[,imap_user,imap_password_env]` rows (header aliases accepted); `build_config_dict()` assembles a `Config`-shaped dict, **validates it via `Config.model_validate`**, and `dump_config_yaml()` serializes it. All four are unit-tested in `tests/test_configgen.py` without typer or any network client; `cli.py:init_config` is a thin wrapper that catches `ConfigGenError` and writes the file (guarded by `--force`).
 
 ### Rate Limiting (Three-Layer System)
 
@@ -105,47 +114,40 @@ If a job is interrupted and re-run, it resumes from the first `pending` item. Th
 
 1. **Orchestrator.run_workload()** creates a ThreadPoolExecutor with concurrency = config.workloads.{workload}.concurrency (typically 2–4 per workload).
 2. Each thread calls `_run_user(workload_name, job_fn, user, mode)`:
-   - Writes JobRun row to DB with status="running"
-   - Calls `job_fn(user, GraphClient, mode)`
+   - Writes JobRun row to DB with status="running" (`JobRun.user_email` holds `source_id`)
+   - Builds a per-thread source connector + destination GraphClient, wraps them in a `JobContext`, and calls `job_fn(ctx)`
    - Updates JobRun.status to "done" or "failed"
-3. Each job gets its own GraphClient instance (ephemeral HTTP client + token provider).
+3. Each job gets its own destination GraphClient (ephemeral HTTP client + token provider). For a `microsoft365` source, a second per-thread **source** GraphClient is built from the source-tenant token provider and injected into `M365Source`.
 4. **State access:** All state reads/writes use `session_scope()` context manager, which creates a fresh session per scope. Session is committed on exit (exception triggers rollback). This is SQLAlchemy's recommended pattern for thread-safe concurrent access.
 
 **Why separate GraphClient per thread:** MS token provider may refresh tokens. Using one shared client would require synchronization; separate clients per thread are simpler and each thread maintains its own token state.
 
-### Google is Read-Only
+### Sources never write back; destination is always Graph
 
-All Google OAuth scopes are `.readonly`:
-```
-gmail.readonly
-drive.readonly
-contacts.readonly
-calendar.readonly
-```
-
-Jobs NEVER write to Google. All writes go to Microsoft Graph API (Outlook, OneDrive, SharePoint). This is a safety invariant: if the code ever accidentally calls a write method on Google services, it will fail with permission denied.
+The `google_workspace` source uses `.readonly` OAuth scopes (gmail/drive/contacts/calendar); the `imap` source connects read-only; the `microsoft365` source only reads from the source tenant. Connectors never mutate the source — all writes go to the Microsoft Graph destination (Outlook, OneDrive, SharePoint). Treat this as a safety invariant when adding source methods.
 
 ### Job Execution Model
 
-**Signature:** `fn(user: UserMapping, gc: GraphClient, mode: str) → None`
+**Signature:** `fn(ctx: JobContext) → None`
 
-**Parameters:**
-- `user`: Mapping of google_email → ms_upn for one user in this thread's batch
-- `gc`: GraphClient instance bound to this thread (not thread-safe across threads)
-- `mode`: "full" (initial migration) or "delta" (incremental post-cutover sync)
+`JobContext` (`context.py`) carries `user` (a `UserMapping`, `source_id`→`dest_id`), `source` (the `BaseSource` connector for this thread), `dest_gc` (destination GraphClient, or `None` in whatif), `mode`, and `config`. Jobs are source-agnostic: they iterate `ctx.source.iter_*` items and write via `microsoft/*` with `ctx.dest_gc`.
+
+**First line of every job:** `ctx.require_capability("<workload>")` — raises if the configured source doesn't support it.
 
 **Mode behavior:**
-- `"full"`: Process all items from source. On delta-capable workloads, fetch and store sync cursor for next run.
-- `"delta"`: Retrieve stored sync cursor, fetch only changed items from source since that cursor, process them.
-- `"whatif"`: Inventory only. Jobs branch to a `_whatif_<workload>` path that enumerates source items and writes rows to `_pkg._current_manifest` (a `ManifestWriter`). No Microsoft Graph calls, no `ItemMap`/`SyncCursor` writes. `gc` is passed as `None`; jobs must guard with `assert gc is not None` for non-whatif paths.
+- `"full"`: Process all items. Connectors capture a sync cursor during iteration; the job persists it via `ctx.source.get_last_cursor(key)` afterward.
+- `"delta"`: Read the stored cursor, pass it as `since` to the connector, process only changed items.
+- `"whatif"`: Inventory only. Jobs branch to `_whatif_<workload>`, iterate `ctx.source.inventory_*`, and write rows to `_pkg._current_manifest` (a `ManifestWriter`). No Graph calls, no `ItemMap`/`SyncCursor` writes. `ctx.dest_gc` is `None`.
 
 Example (contacts_job.py):
 ```python
-sync_token = get_cursor(s, user.google_email, "contacts") if mode == "delta" else None
-contacts, new_sync_token = iter_contacts(google_cfg, user.google_email, sync_token)
-# ... process contacts ...
-if new_sync_token:
-    save_cursor(s, user.google_email, "contacts", new_sync_token)
+ctx.require_capability("contacts")
+since = get_cursor(s, user.source_id, "contacts") if ctx.mode == "delta" else None
+for contact in ctx.source.iter_contacts(user, since):
+    dest_id = create_contact(gc, ms_user_id, folder_id, contact.graph_body)
+    upsert_item(s, user.source_id, "contacts", contact.source_id, dest_id=dest_id, status="done")
+if (cursor := ctx.source.get_last_cursor("contacts")):
+    save_cursor(s, user.source_id, "contacts", cursor)
 ```
 
 ### Error Handling & Retries
@@ -158,14 +160,20 @@ if new_sync_token:
 
 ### Config Propagation to Jobs
 
-Jobs retrieve config via:
-```python
-import migrator as _pkg
-cfg = _pkg._current_config
-assert cfg is not None, "Orchestrator must set _current_config before dispatching"
-```
+Per-job config arrives via `ctx.config` (and `ctx.source`/`ctx.dest_gc`) — see Job Execution Model. The package-level `_pkg._current_config` / `_pkg._current_manifest` globals remain: `_current_config` is set by the Orchestrator in `__init__()`, and whatif jobs read `_current_manifest` (set by the `whatif` CLI command) to record planned items.
 
-The assertion documents the dependency. Orchestrator sets `_pkg._current_config = config` in `__init__()` before any job runs. This happens once per CLI invocation.
+### SharePoint migrations (tenant-level, not per-user)
+
+Two SharePoint flows exist; both bypass the per-user `run_workload` path and instead use a dedicated `Orchestrator` method that builds one source + one destination client and a sentinel `JobContext`. Both upload through the shared `microsoft/files.py` writers with `drive_root=f"drives/{dest_drive_id}"` and namespace state by source id (`shared_drive:<id>` / `sharepoint_site:<id>`).
+
+- **`migrator shared-drives`** (google_workspace source) — `Orchestrator.run_shared_drives()` impersonates the Workspace `admin_email` to enumerate/download Drive content, and for each `shared_drives` mapping calls `microsoft/sharepoint.py:ensure_site_for_drive()` — provisions a connected M365 group/team site (`POST /groups`, polls `/groups/{id}/sites/root`), resolves its default document library, and records it in `FolderMap` (`workload="sharepoint_site"`) for idempotent reuse.
+- **`migrator sharepoint`** (microsoft365 source) — `Orchestrator.run_sharepoint_sites()` migrates SharePoint libraries tenant-to-tenant. `M365Source.resolve_site_drive()` resolves the source site's library drive; the destination is an existing `dest_site` (`resolve_existing_site_drive()`) or an auto-provisioned `target_site_alias` (reusing `ensure_site_for_drive()`).
+
+`M365Source` file reads are **drive-generic**: `_iter_drive(drive_root, …)` walks any drive's delta feed and stamps `SourceFile.drive_root` so `fetch_file()` reads content from the right drive (OneDrive `users/<id>/drive` or SharePoint `drives/<id>`). Both flows require `Group.ReadWrite.All` + `Sites.*` on the destination app (only auto-provisioning needs `Group.ReadWrite.All`).
+
+**Delta support.** Both flows accept `--delta` (`Orchestrator.run_shared_drives(mode=...)` / `run_sharepoint_sites(mode=...)`), mirroring the per-mailbox delta handling in `files_job.run_files`. The two helpers `files_job._delta_cursor()` / `_persist_cursor()` wrap the SyncCursor read/write: a full pass passes `since=None` and persists the cursor the connector captured during iteration; a delta pass reads the stored cursor and passes it as `since` (skipping any drive/site with no seeded cursor). Cursors are namespaced in SyncCursor by the per-flow workload string (`shared_drive:<drive_id>` / `sharepoint_site:<site_id>`) under `ctx.user.source_id` (the impersonation admin / the `__sharepoint__` sentinel).
+> - **shared-drives** (Google source): `iter_shared_drive_files(user, drive, since)` captures a per-drive Changes-API page token (`drive.py:get_changes_start_token(drive_id=…)`) on the full pass and uses `iter_drive_changes(…, drive_id=…)` on delta. Connector cursor key == workload string (`shared_drive:<drive_id>`).
+> - **sharepoint** (M365 source): `iter_site_files(drive_id, since)` → `_iter_drive()` captures the Graph deltaLink under connector key `sharepoint:<source_drive_id>`; the job re-reads it via that key but persists/loads SyncCursor under `sharepoint_site:<source_site_id>`.
 
 ### Workload Structure
 
@@ -176,3 +184,42 @@ Each workload (contacts, calendar, files, mail) is isolated:
 - Separate concurrency and feature configs (e.g., MailWorkloadConfig.multi_label_policy)
 
 This allows workloads to run independently, be enabled/disabled, and be re-run without affecting others.
+
+### Transform Layer
+
+`src/migrator/transform/` holds the pure (no I/O) Google→Graph data-model conversions. Jobs call these to translate source shapes into Graph request bodies. Keep this logic here rather than inline in jobs — it is unit-testable in isolation and shared across full/delta/whatif modes.
+
+- **labels.py** — `label_to_folder_path()` maps a Gmail label to an Outlook folder path (rewriting `/` separators to `\`). `resolve_label_placement()` is the core mail-foldering logic: it maps system labels to well-known Outlook folders (via `SYSTEM_LABEL_FOLDER`; some resolve to `None` and become flags/categories or are skipped) and applies `MailWorkloadConfig.multi_label_policy` to user labels — `"categories"` files a message in one primary folder and attaches the rest as Outlook categories, `"duplicate"` copies it into every label's folder. Returns `(folder_paths, categories)`.
+- **recurrence.py** — `rrule_to_graph_recurrence()` converts an iCal RRULE string + start datetime into a Graph `recurrence` object (pattern + range). Handles BYDAY→daysOfWeek, weekly/monthly/yearly indices, and the weekday derived from the event start.
+- **paths.py** — `sanitize_segment()` / `sanitize_path()` strip characters illegal in OneDrive/SharePoint names so Drive folder structures map cleanly.
+- **identities.py** — `IdentityMap` rewrites source identities to destination M365 UPNs using `config.users` (`source_id` → `dest_id`) as the source of truth — pure/deterministic, no Graph calls. `map_address()` returns the mapped address (or the original when unmapped, so external attendees pass through); `remap_event()` rewrites attendee + organizer addresses on a Graph event body in place. Applied by `calendar_job.run_calendar` before `create_event`, so migrated events reference live destination mailboxes rather than dead source ones.
+
+### Whatif Manifest Injection
+
+Parallel to `_current_config`, the package holds `_pkg._current_manifest: ManifestWriter | None` (`src/migrator/__init__.py`). The `whatif` CLI command sets it around the run; jobs in `whatif` mode write inventory rows to it instead of calling Graph. It is `None` outside whatif runs.
+
+### Microsoft Auth Modes
+
+`MSTokenProvider` (auth/ms_auth.py) is an MSAL confidential-client provider with a thread lock and serialized disk token cache. It accepts **either** `certificate_path` + `certificate_thumbprint` (preferred) **or** `client_secret`; supplying neither raises at construction. Scope is fixed to `https://graph.microsoft.com/.default` (app-only). Each per-thread GraphClient holds its own provider — see "Threading & Job Dispatch".
+
+## Known Gaps / TODO
+
+Open work items identified during review (roughly ordered by data-fidelity impact). None of these are wired up yet — treat as the backlog.
+
+### Correctness / data fidelity
+- **Timestamp-based delta for mail/contacts/calendar is lossy.** Only files use real Graph delta tokens; mail/contacts/calendar set the cursor to "now" and filter on `receivedDateTime`/`lastModifiedDateTime ge since` (`connectors/m365.py`). This misses folder moves and read/flag/category changes after cutover, and is clock-skew sensitive. Move these workloads to proper Graph delta queries (`/messages/delta`, `/contacts/delta`, `/events/delta`).
+- ~~**Calendar attendees/organizer keep source-tenant addresses.**~~ *Done.* `calendar_job.run_calendar` now applies `transform/identities.py:IdentityMap.remap_event()` (config-driven `source_id`→`dest_id`) to each event body before `create_event`, rewriting attendee + organizer addresses to destination UPNs. Note the M365 source still doesn't carry `organizer` in `_EVENT_FIELDS` (Graph sets organizer to the calendar owner on create), so the organizer remap is defensive for now.
+- **Recurring-event exceptions are lost.** Only the series master + plain instances are pulled; modified single occurrences of a recurring series aren't reconciled.
+- **No contact photos or calendar attachments.** `_CONTACT_FIELDS` omits the photo; `create_event` posts only the body, not event attachments.
+
+### Coverage / functionality
+- **No permissions/sharing migration.** `SourceFile` carries no ACL data — Drive/SharePoint sharing, link permissions, and ownership are dropped. Commonly required; needs a permissions model on `SourceFile` plus a destination writer.
+- **`validate` report can't detect data loss.** `reporting.py` only counts local `ItemMap` statuses — it never reconciles source vs. destination item counts/checksums, so silently-skipped or never-enumerated items won't surface. Add source↔dest reconciliation. *(Partly addressed: the report no longer hardcodes `("contacts","calendar","files","mail")` — it now discovers every `(user, workload)` pair from `ItemMap` so `shared_drive:*` / `sharepoint_site:*` results appear, unioned with the standard per-user workloads so a configured user with zero rows still surfaces.)*
+- **Thin pre-flight checks.** `smoke-test` probes one pilot user only; there's no bulk validation that all `dest_id` mailboxes exist / are licensed / are provisioned before a `run-all`.
+
+### Reliability / scale
+- **Files are fully buffered in memory.** `fetch_file` returns full `bytes` and the upload writers take full `content: bytes` — a multi-GB file is loaded entirely into RAM on both download and upload. Stream download→upload to cap memory and lift the practical file-size ceiling.
+- **Tenant-level SharePoint/Shared-Drive flows are single-threaded.** `run_shared_drives` / `run_sharepoint_sites` loop drives and files sequentially (no `ThreadPoolExecutor`), unlike the per-user workloads. Parallelize for large libraries.
+
+### Testing
+- **Job/writer paths lack mocked-Graph coverage.** Tests are mostly pure-logic plus the new mail-writer tests; the per-user job loops (contacts/calendar/files/mail) and the Graph writers have no fake-client integration tests. Add a recording/fake GraphClient harness and cover the job loops end-to-end.

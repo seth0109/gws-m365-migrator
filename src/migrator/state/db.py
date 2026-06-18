@@ -1,14 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session, sessionmaker
 
-from .models import Base, FolderMap, ItemMap, JobRun, SyncCursor
+from .models import Base, FolderMap, ItemMap, SyncCursor
 
 _engine = None
 _SessionFactory = None

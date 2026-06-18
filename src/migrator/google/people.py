@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Generator
+from typing import Any
 
 from ..auth.google_auth import build_service
 from ..config import GoogleConfig

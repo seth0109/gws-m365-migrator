@@ -7,8 +7,8 @@ if TYPE_CHECKING:
     from .whatif import ManifestWriter
 
 # Set by Orchestrator before dispatching any workload job so jobs can access config.
-_current_config: "Config | None" = None
+_current_config: Config | None = None
 
 # Set by Orchestrator in whatif (dry-run) mode so jobs can record planned items.
 # None outside whatif runs.
-_current_manifest: "ManifestWriter | None" = None
+_current_manifest: ManifestWriter | None = None

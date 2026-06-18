@@ -1,55 +1,38 @@
 from __future__ import annotations
 
-import email as email_lib
 import logging
-from typing import Any
 
-from ..config import UserMapping
-from ..google.gmail import (
-    decode_raw_mime,
-    get_history_id,
-    iter_message_metadata,
-    iter_messages,
-    list_labels,
+from ..context import JobContext
+from ..microsoft.mail import (
+    ensure_mail_folder,
+    import_mime_message,
+    patch_message_flags,
+    resolve_folder_segment,
 )
-from ..microsoft.graph_client import GraphClient
-from ..microsoft.mail import ensure_mail_folder, import_mime_message, patch_message_flags
 from ..state.db import get_cursor, is_done, save_cursor, session_scope, upsert_folder, upsert_item
-from ..transform.labels import MultiLabelPolicy, resolve_label_placement
 
 log = logging.getLogger(__name__)
 
 
-def run_mail(user: UserMapping, gc: GraphClient | None, mode: str) -> None:
-    import migrator as _pkg
-    cfg = _pkg._current_config
-    assert cfg is not None
+def run_mail(ctx: JobContext) -> None:
+    ctx.require_capability("mail")
+    user = ctx.user
 
-    google_cfg = cfg.google
-    policy: MultiLabelPolicy = cfg.workloads.mail.multi_label_policy
-
-    if mode == "whatif":
-        _whatif_mail(user, google_cfg, policy)
+    if ctx.mode == "whatif":
+        _whatif_mail(ctx)
         return
 
+    gc = ctx.dest_gc
     assert gc is not None, "GraphClient required outside whatif mode"
 
-    ms_user = gc.get(f"/users/{user.ms_upn}", params={"$select": "id"})
+    ms_user = gc.get(f"/users/{user.dest_id}", params={"$select": "id"})
     ms_user_id: str = ms_user["id"]
 
-    # Capture history cursor before we start reading (for delta pass use)
-    if mode == "full":
-        history_id = get_history_id(google_cfg, user.google_email)
+    since: str | None = None
+    if ctx.mode == "delta":
         with session_scope() as s:
-            save_cursor(s, user.google_email, "mail", history_id)
-        history_id_for_read = None
-    else:
-        with session_scope() as s:
-            history_id_for_read = get_cursor(s, user.google_email, "mail")
+            since = get_cursor(s, user.source_id, "mail")
 
-    # Build label map and folder cache
-    raw_labels = list_labels(google_cfg, user.google_email)
-    label_map: dict[str, str] = {lbl["id"]: lbl["name"] for lbl in raw_labels}
     folder_cache: dict[str, str] = {}  # folder_path → graph_folder_id
 
     def _get_folder(path: str) -> str:
@@ -57,86 +40,80 @@ def run_mail(user: UserMapping, gc: GraphClient | None, mode: str) -> None:
             return folder_cache[path]
         parts = path.split("\\")
         parent_id: str | None = None
-        for part in parts:
-            current_path = "\\".join(parts[: parts.index(part) + 1])
+        for i, part in enumerate(parts):
+            current_path = "\\".join(parts[: i + 1])
             if current_path in folder_cache:
                 parent_id = folder_cache[current_path]
-            else:
-                fid = ensure_mail_folder(gc, ms_user_id, part, parent_id)
-                folder_cache[current_path] = fid
-                with session_scope() as s:
-                    upsert_folder(s, user.google_email, "mail", current_path, fid, current_path)
-                parent_id = fid
+                continue
+            # Route a top-level system folder (Inbox/SentItems/...) to its
+            # well-known Graph folder id instead of creating a duplicate.
+            wk = resolve_folder_segment(part, is_top_level=(i == 0))
+            fid = wk if wk is not None else ensure_mail_folder(gc, ms_user_id, part, parent_id)
+            folder_cache[current_path] = fid
+            with session_scope() as s:
+                upsert_folder(s, user.source_id, "mail", current_path, fid, current_path)
+            parent_id = fid
         return folder_cache[path]
 
-    for msg in iter_messages(google_cfg, user.google_email, history_id=history_id_for_read):
-        msg_id: str = msg.get("id", "")
-
-        # Use Message-ID header as dedup hash
-        raw_bytes = decode_raw_mime(msg.get("raw", ""))
-        parsed = email_lib.message_from_bytes(raw_bytes)
-        source_hash = parsed.get("Message-ID", msg_id)
-
+    for msg in ctx.source.iter_messages(user, since):
         with session_scope() as s:
-            if is_done(s, user.google_email, "mail", msg_id):
+            if is_done(s, user.source_id, "mail", msg.source_id):
                 continue
 
-        label_ids: list[str] = msg.get("labelIds", [])
-        is_unread = "UNREAD" in label_ids
-        is_read = not is_unread
-
-        folder_paths, categories = resolve_label_placement(label_ids, label_map, policy)
-
+        folder_paths = msg.folder_paths or ["Inbox"]
         try:
+            dest_id: str | None = None
             for folder_path in folder_paths:
                 folder_id = _get_folder(folder_path)
-                dest_id = import_mime_message(gc, ms_user_id, folder_id, raw_bytes)
-                patch_message_flags(gc, ms_user_id, dest_id, is_read=is_read, categories=categories or None)
-
+                dest_id = import_mime_message(gc, ms_user_id, folder_id, msg.raw_mime)
+                patch_message_flags(
+                    gc, ms_user_id, dest_id,
+                    is_read=msg.is_read, categories=msg.categories or None,
+                )
             with session_scope() as s:
                 upsert_item(
-                    s, user.google_email, "mail", msg_id,
-                    source_hash=source_hash, dest_id=dest_id, status="done",
+                    s, user.source_id, "mail", msg.source_id,
+                    source_hash=msg.dedup_hash or None, dest_id=dest_id, status="done",
                 )
         except Exception as exc:
-            log.error("Failed message %s: %s", msg_id, exc)
+            log.error("Failed message %s: %s", msg.source_id, exc)
             with session_scope() as s:
-                upsert_item(s, user.google_email, "mail", msg_id, status="failed", last_error=str(exc))
+                upsert_item(
+                    s, user.source_id, "mail", msg.source_id, status="failed", last_error=str(exc)
+                )
+
+    new_cursor = ctx.source.get_last_cursor("mail")
+    if new_cursor:
+        with session_scope() as s:
+            save_cursor(s, user.source_id, "mail", new_cursor)
 
 
-def _whatif_mail(user: UserMapping, google_cfg: Any, policy: MultiLabelPolicy) -> None:
+def _whatif_mail(ctx: JobContext) -> None:
     import migrator as _pkg
+
     manifest = _pkg._current_manifest
     assert manifest is not None, "ManifestWriter must be set in whatif mode"
+    user = ctx.user
 
-    raw_labels = list_labels(google_cfg, user.google_email)
-    label_map: dict[str, str] = {lbl["id"]: lbl["name"] for lbl in raw_labels}
-
-    for msg in iter_message_metadata(google_cfg, user.google_email):
-        msg_id = msg.get("id", "")
-        if not msg_id:
-            continue
-        label_ids = msg.get("labelIds", [])
-        folder_paths, categories = resolve_label_placement(label_ids, label_map, policy)
-        primary_folder = folder_paths[0] if folder_paths else "Inbox"
-        extra = f"+{len(folder_paths) - 1} more" if len(folder_paths) > 1 else ""
+    for msg in ctx.source.inventory_messages(user):
+        folder_paths = msg.folder_paths or ["Inbox"]
+        primary = folder_paths[0]
         notes_parts = []
-        if extra:
-            notes_parts.append(f"folders: {primary_folder}{extra}")
-        if categories:
-            notes_parts.append(f"categories: {','.join(categories)}")
-        if "UNREAD" in label_ids:
+        if len(folder_paths) > 1:
+            notes_parts.append(f"folders: {primary}+{len(folder_paths) - 1} more")
+        if msg.categories:
+            notes_parts.append(f"categories: {','.join(msg.categories)}")
+        if not msg.is_read:
             notes_parts.append("unread")
 
-        headers = msg.get("headers", {})
         manifest.add(
-            user_email=user.google_email,
-            ms_upn=user.ms_upn,
+            source_user=user.source_id,
+            dest_user=user.dest_id,
             workload="mail",
-            source_id=msg_id,
-            source_path=primary_folder,
-            name=headers.get("Subject", "(no subject)"),
-            size_bytes=msg.get("sizeEstimate", ""),
-            modified_time=headers.get("Date", ""),
-            notes="; ".join(notes_parts) or f"from={headers.get('From', '')}",
+            source_id=msg.source_id,
+            source_path=primary,
+            name=msg.subject or "(no subject)",
+            size_bytes=msg.size_bytes,
+            modified_time=msg.date,
+            notes="; ".join(notes_parts) or (f"from={msg.sender}" if msg.sender else ""),
         )
