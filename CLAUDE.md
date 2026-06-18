@@ -34,6 +34,7 @@ Strict mode enabled (strict = true). Python 3.11+.
 ### Run the CLI Tool
 ```bash
 migrator --help                              # Show all commands
+migrator init-config --type <src> --tenant-id .. --client-id .. --thumbprint .. -m users.csv  # Scaffold config.yaml from credentials/ + mapping CSV
 migrator contacts --config config.yaml      # Migrate contacts
 migrator calendar --config config.yaml      # Migrate calendar
 migrator files --config config.yaml         # Migrate personal files → OneDrive
@@ -59,6 +60,10 @@ The tool migrates from a pluggable **source** to a Microsoft 365 **destination**
 - **JobContext** (`context.py`): replaces the old global-config injection for per-job data. The Orchestrator builds `JobContext(user, source, dest_gc, mode, config)` per user and calls `fn(ctx)`. `ctx.require_capability(workload)` raises if the source can't do that workload. (`_current_config`/`_current_manifest` globals remain only for whatif manifest access.)
 
 **Key leverage:** every mail source emits raw MIME and `microsoft/files.py` takes a `drive_root` prefix — so the destination writers (`microsoft/{mail,files,contacts,calendar}.py`) are shared unchanged across all source types and across OneDrive vs SharePoint.
+
+### Config Scaffolding (`init-config`)
+
+`src/migrator/configgen.py` holds the pure, network-free logic behind the `init-config` CLI command: `discover_credentials()` resolves the service-account JSON / certificate PEM(s) in a `credentials/` folder (a `microsoft365` source needs two PEMs, disambiguated by `source*`/`dest*` filename keyword); `parse_mapping_csv()` reads `source_id,dest_id[,imap_user,imap_password_env]` rows (header aliases accepted); `build_config_dict()` assembles a `Config`-shaped dict, **validates it via `Config.model_validate`**, and `dump_config_yaml()` serializes it. All four are unit-tested in `tests/test_configgen.py` without typer or any network client; `cli.py:init_config` is a thin wrapper that catches `ConfigGenError` and writes the file (guarded by `--force`).
 
 ### Rate Limiting (Three-Layer System)
 

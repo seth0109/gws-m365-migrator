@@ -53,13 +53,52 @@ cd m365-migrator
 # 2. Install in editable mode with dev extras
 pip install -e ".[dev]"
 
-# 3. Copy and edit the example config
+# 3a. Generate a config from your credentials + a user-mapping CSV (recommended)
+migrator init-config --type google_workspace \
+  --tenant-id <dest-tenant> --client-id <dest-app> --thumbprint <dest-cert-thumbprint> \
+  --admin-email admin@yourdomain.com --mapping users.csv
+
+# 3b. ...or copy and hand-edit the example
 cp config.example.yaml config.yaml
 ```
 
 Place credentials under `credentials/` (e.g. `google-service-account.json`, `ms-cert.pem`).
 
-Edit `config.yaml` (see `config.example.yaml` for all three source blocks):
+### Scaffold a config (`init-config`)
+
+`migrator init-config` writes a validated `config.yaml` for you. It discovers the
+service-account JSON and certificate PEM(s) in `--credentials-dir` (default
+`credentials/`), reads user mappings from a CSV, and fills in the rest:
+
+```bash
+# Google Workspace source
+migrator init-config -t google_workspace \
+  --tenant-id <dest-tenant> --client-id <dest-app> --thumbprint <dest-thumbprint> \
+  --admin-email admin@yourdomain.com -m users.csv
+
+# IMAP source
+migrator init-config -t imap \
+  --tenant-id <dest-tenant> --client-id <dest-app> --thumbprint <dest-thumbprint> \
+  --imap-host imap.example.com -m users.csv
+
+# Microsoft 365 → Microsoft 365 (needs a second, source-tenant certificate)
+migrator init-config -t microsoft365 \
+  --tenant-id <dest-tenant> --client-id <dest-app> --thumbprint <dest-thumbprint> \
+  --source-tenant-id <src-tenant> --source-client-id <src-app> --source-thumbprint <src-thumbprint> \
+  -m users.csv
+```
+
+- **Credential discovery** — a lone `*.json` becomes the Google service-account key; a
+  lone `*.pem` becomes the destination certificate. A `microsoft365` source needs two
+  PEMs, disambiguated by filename keyword (`source*` vs `dest*`). Resolve any ambiguity
+  with `--service-account-key`, `--cert`, and `--source-cert`.
+- **Mapping CSV** (`-m/--mapping`) — headers `source_id,dest_id` (aliases like `from`/`to`
+  accepted), plus optional `imap_user,imap_password_env`. Omit `--mapping` to emit a
+  placeholder `users[]` entry to fill in by hand.
+- Writes to `config.yaml` by default (`-o` to change); refuses to clobber an existing file
+  unless you pass `--force`.
+
+Edit the result (see `config.example.yaml` for all three source blocks):
 
 - `source:` — pick **one** `type` (`google_workspace` | `imap` | `microsoft365`) and fill its fields
 - `destination:` — `tenant_id` / `client_id` / cert thumbprint (or `client_secret`) from the destination Entra app

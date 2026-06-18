@@ -222,6 +222,131 @@ def whatif(
     console.print(f"[green]Whatif manifest written: {output} ({count} items)")
 
 
+@app.command("init-config")
+def init_config(
+    source_type: Annotated[
+        str,
+        typer.Option(
+            "--type",
+            "-t",
+            help="Source type: google_workspace | imap | microsoft365",
+        ),
+    ],
+    tenant_id: Annotated[
+        str, typer.Option("--tenant-id", help="Destination M365 tenant id")
+    ],
+    client_id: Annotated[
+        str, typer.Option("--client-id", help="Destination Entra app client id")
+    ],
+    thumbprint: Annotated[
+        str, typer.Option("--thumbprint", help="Destination certificate thumbprint")
+    ],
+    mapping: Annotated[
+        Path | None,
+        typer.Option("--mapping", "-m", help="User-mapping CSV (source_id,dest_id[,imap_*])"),
+    ] = None,
+    credentials_dir: Annotated[
+        Path, typer.Option("--credentials-dir", help="Folder holding the JSON/PEM credentials")
+    ] = Path("credentials"),
+    output: Annotated[
+        Path, typer.Option("--output", "-o", help="Where to write the generated config")
+    ] = Path("config.yaml"),
+    force: Annotated[
+        bool, typer.Option("--force", help="Overwrite the output file if it exists")
+    ] = False,
+    # Source-specific options (only the relevant ones are required).
+    admin_email: Annotated[
+        str | None, typer.Option("--admin-email", help="[google_workspace] delegated admin email")
+    ] = None,
+    imap_host: Annotated[
+        str | None, typer.Option("--imap-host", help="[imap] server hostname")
+    ] = None,
+    imap_port: Annotated[int, typer.Option("--imap-port", help="[imap] server port")] = 993,
+    imap_ssl: Annotated[
+        bool, typer.Option("--imap-ssl/--no-imap-ssl", help="[imap] use SSL")
+    ] = True,
+    source_tenant_id: Annotated[
+        str | None, typer.Option("--source-tenant-id", help="[microsoft365] source tenant id")
+    ] = None,
+    source_client_id: Annotated[
+        str | None, typer.Option("--source-client-id", help="[microsoft365] source app client id")
+    ] = None,
+    source_thumbprint: Annotated[
+        str | None,
+        typer.Option("--source-thumbprint", help="[microsoft365] source certificate thumbprint"),
+    ] = None,
+    # Explicit credential overrides (resolve ambiguity in --credentials-dir).
+    service_account_key: Annotated[
+        Path | None, typer.Option("--service-account-key", help="Override discovered JSON key")
+    ] = None,
+    cert: Annotated[
+        Path | None, typer.Option("--cert", help="Override discovered destination PEM")
+    ] = None,
+    source_cert: Annotated[
+        Path | None, typer.Option("--source-cert", help="Override discovered source PEM")
+    ] = None,
+) -> None:
+    """Scaffold a config.yaml from CLI inputs, a credentials/ folder, and a mapping CSV.
+
+    Auto-discovers the service-account JSON and certificate PEM(s) in
+    --credentials-dir, reads the user mappings from --mapping, and writes a
+    validated config to --output.
+    """
+    from .configgen import (
+        ConfigGenError,
+        build_config_dict,
+        discover_credentials,
+        dump_config_yaml,
+        parse_mapping_csv,
+    )
+
+    if output.exists() and not force:
+        console.print(f"[red]{output} already exists. Pass --force to overwrite.")
+        raise typer.Exit(1)
+
+    try:
+        creds = discover_credentials(
+            credentials_dir,
+            source_type,
+            service_account_key=service_account_key,
+            dest_cert=cert,
+            source_cert=source_cert,
+        )
+
+        if mapping is not None:
+            users = parse_mapping_csv(mapping)
+        else:
+            console.print(
+                "[yellow]No --mapping CSV given; writing a placeholder users[] entry to edit."
+            )
+            users = [{"source_id": "CHANGE_ME@source", "dest_id": "CHANGE_ME@dest"}]
+
+        cfg = build_config_dict(
+            source_type=source_type,
+            creds=creds,
+            users=users,
+            dest_tenant_id=tenant_id,
+            dest_client_id=client_id,
+            dest_thumbprint=thumbprint,
+            admin_email=admin_email,
+            imap_host=imap_host,
+            imap_port=imap_port,
+            imap_ssl=imap_ssl,
+            source_tenant_id=source_tenant_id,
+            source_client_id=source_client_id,
+            source_thumbprint=source_thumbprint,
+        )
+    except ConfigGenError as exc:
+        console.print(f"[red]{exc}")
+        raise typer.Exit(1) from exc
+
+    output.write_text(dump_config_yaml(cfg))
+    console.print(
+        f"[green]Wrote {output} — source '{source_type}', {len(users)} user mapping(s)."
+    )
+    console.print("[dim]Review it, then run: migrator smoke-test --config " + str(output))
+
+
 @app.command()
 def validate(
     config: Annotated[Path, _CONFIG_OPT] = Path("config.yaml"),
