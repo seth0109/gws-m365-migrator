@@ -8,6 +8,7 @@ from ..connectors.base import SourceFile
 from ..context import JobContext
 from ..microsoft.files import (
     ensure_folder,
+    ensure_onedrive,
     update_file_content,
     upload_large_file,
     upload_small_file,
@@ -43,6 +44,11 @@ def run_files(ctx: JobContext) -> None:
 
     ms_user = gc.get(f"/users/{user.dest_id}", params={"$select": "id"})
     ms_user_id: str = ms_user["id"]
+
+    # OneDrive is provisioned lazily; make sure it exists before writing files so
+    # an unprovisioned mailbox fails fast with a clear message rather than an
+    # opaque 404 on the first upload. Skips just this user (orchestrator continues).
+    ensure_onedrive(gc, ms_user_id)
 
     drive_root = f"users/{ms_user_id}/drive"  # personal files → OneDrive
     folder_id_cache: dict[str, str] = {}

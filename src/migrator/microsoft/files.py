@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+import time
+
+import httpx
 
 from .graph_client import GRAPH_BASE, GraphClient
 
@@ -8,6 +11,53 @@ log = logging.getLogger(__name__)
 
 # Chunk size must be a multiple of 320 KiB; use 10 MiB
 _CHUNK_SIZE = 10 * 1024 * 1024
+
+# OneDrive ("mysite") is provisioned lazily — the first GET of /users/{id}/drive
+# 404s with "mysite not found" but queues provisioning, which then takes seconds
+# to a minute or two. Poll until it materializes before giving up.
+_PROVISION_WAITS = (0, 5, 10, 20, 30, 30, 30, 30)  # ~2.5 min total
+
+
+def _is_mysite_missing(resp: httpx.Response) -> bool:
+    """True if a 404 is the 'OneDrive not provisioned yet' signal (vs. a real
+    missing-resource error like a bad user id)."""
+    if resp.status_code != 404:
+        return False
+    text = resp.text.lower()
+    return "mysite" in text or "resourcenotfound" in text
+
+
+def ensure_onedrive(gc: GraphClient, ms_user_id: str) -> None:
+    """Ensure the user's OneDrive exists, triggering + waiting for provisioning.
+
+    The first GET of /users/{id}/drive both resolves the drive and (for an
+    unprovisioned user) queues its creation, returning 404 "User's mysite not
+    found" until it comes online. Poll across _PROVISION_WAITS, returning as soon
+    as the drive resolves. Raises a clear, actionable error if it never appears so
+    the failure isn't an opaque mid-stream 404 on the first file write."""
+    for attempt, delay in enumerate(_PROVISION_WAITS, start=1):
+        if delay:
+            time.sleep(delay)
+        try:
+            gc.get(
+                f"/users/{ms_user_id}/drive", params={"$select": "id"}, user_key=ms_user_id
+            )
+            return
+        except httpx.HTTPStatusError as exc:
+            if not _is_mysite_missing(exc.response):
+                raise
+            log.warning(
+                "OneDrive for %s not provisioned yet — waiting for provisioning "
+                "(attempt %d/%d)",
+                ms_user_id,
+                attempt,
+                len(_PROVISION_WAITS),
+            )
+    raise RuntimeError(
+        f"OneDrive for user {ms_user_id} is not provisioned and did not come online "
+        "within the wait window. Pre-provision it (SharePoint admin: "
+        "Request-SPOPersonalSite, or have the user sign in to OneDrive once) and re-run."
+    )
 
 # `drive_root` is the full Graph path prefix to a drive, without a leading slash:
 #   - OneDrive:   "users/<user-id>/drive"
