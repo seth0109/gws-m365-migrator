@@ -91,6 +91,10 @@ def import_mime_message(
         # An empty body POSTs as "" and Graph rejects it with the opaque
         # UnableToDeserializePostBody 400. Fail with a clear reason instead.
         raise ValueError("source returned empty MIME body; nothing to import")
+    # Normalize up front so the small/large threshold reflects what we'll actually
+    # send (CRLF expansion grows the message); _post_mime re-normalizes too, since
+    # the large-attachment path re-serializes back to bare LF.
+    raw_mime = _normalize_crlf(raw_mime)
     if len(raw_mime) <= _MAX_MIME_SINGLE_POST:
         return _post_mime(gc, ms_user_id, folder_id, raw_mime)
 
@@ -101,9 +105,20 @@ def import_mime_message(
     return message_id
 
 
+def _normalize_crlf(raw: bytes) -> bytes:
+    """Force RFC 5322 CRLF line endings.
+
+    Graph's MIME importer rejects bare-LF (or lone-CR) line endings with an
+    opaque 400 UnableToDeserializePostBody. Gmail's ``format=raw`` and Python's
+    ``email`` re-serialization (``policy.default`` uses ``\\n``) both emit bare
+    LF, so normalize before sending. Collapsing to LF first makes this idempotent
+    for messages that are already CRLF."""
+    return raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n").replace(b"\n", b"\r\n")
+
+
 def _post_mime(gc: GraphClient, ms_user_id: str, folder_id: str, raw_mime: bytes) -> str:
     """Single-request MIME import (subject to Graph's 4 MB request cap)."""
-    b64 = base64.b64encode(raw_mime).decode()
+    b64 = base64.b64encode(_normalize_crlf(raw_mime)).decode()
     result = gc.post(
         f"/users/{ms_user_id}/mailFolders/{folder_id}/messages",
         user_key=ms_user_id,
