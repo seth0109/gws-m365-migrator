@@ -162,6 +162,8 @@ def test_import_via_json_builds_message() -> None:
     m["From"] = "Alice <alice@x.com>"
     m["To"] = "Bob <bob@y.com>, carol@z.com"
     m["Cc"] = "dan@w.com"
+    m["Date"] = "Tue, 09 Dec 2025 13:42:55 -0800"
+    m["Message-ID"] = "<abc123@x.com>"
     m.set_content("plain body")
     m.add_alternative("<p>html body</p>", subtype="html")
     m.add_attachment(b"FILEDATA", maintype="application", subtype="octet-stream", filename="f.bin")
@@ -184,7 +186,50 @@ def test_import_via_json_builds_message() -> None:
     assert "html body" in gm["body"]["content"]  # type: ignore[index]
     assert len(gm["toRecipients"]) == 2  # type: ignore[arg-type]
     assert len(gm["ccRecipients"]) == 1  # type: ignore[arg-type]
+    # fidelity fields
+    assert gm["from"]["emailAddress"]["address"] == "alice@x.com"  # type: ignore[index]
+    assert gm["internetMessageId"] == "<abc123@x.com>"
+    assert str(gm["sentDateTime"]).startswith("2025-12-09T13:42:55")  # type: ignore[index]
+    assert gm["receivedDateTime"] == gm["sentDateTime"]
     attachments = gm["attachments"]  # type: ignore[index]
     assert len(attachments) == 1
     assert attachments[0]["name"] == "f.bin"
     assert base64.b64decode(attachments[0]["contentBytes"]) == b"FILEDATA"
+
+
+def test_import_via_json_retries_minimal_when_fidelity_rejected() -> None:
+    from email.message import EmailMessage
+
+    from migrator.microsoft.mail import _import_via_json
+
+    m = EmailMessage()
+    m["Subject"] = "Hi"
+    m["From"] = "ext@sender.com"
+    m["To"] = "owner@dest.com"
+    m["Date"] = "Tue, 09 Dec 2025 13:42:55 -0800"
+    m.set_content("body")
+
+    class _PickyGC:
+        """Rejects the first (fidelity) create with a 400, accepts the minimal one."""
+
+        def __init__(self) -> None:
+            self.bodies: list[dict[str, object]] = []
+
+        def post(self, path: str, user_key: str | None = None, **kwargs: object) -> dict[str, str]:
+            body = kwargs.get("json")
+            self.bodies.append(body)  # type: ignore[arg-type]
+            if "from" in body:  # type: ignore[operator]
+                resp = httpx.Response(
+                    400, text='{"error":{"code":"ErrorInvalidProperty"}}',
+                    request=httpx.Request("POST", "https://g/x"),
+                )
+                raise httpx.HTTPStatusError("boom", request=resp.request, response=resp)
+            return {"id": "minimal-1"}
+
+    gc = _PickyGC()
+    dest = _import_via_json(gc, "u", "inbox", m.as_bytes())  # type: ignore[arg-type]
+    assert dest == "minimal-1"
+    assert len(gc.bodies) == 2
+    assert "from" in gc.bodies[0]
+    assert "from" not in gc.bodies[1]
+    assert "sentDateTime" not in gc.bodies[1]

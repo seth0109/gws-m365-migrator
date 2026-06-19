@@ -229,11 +229,34 @@ def _cleaned_mime(raw_mime: bytes) -> bytes | None:
 def _import_via_json(gc: GraphClient, ms_user_id: str, folder_id: str, raw_mime: bytes) -> str:
     """Create the message via the JSON message API (MIME-import last resort).
 
-    Parses the MIME into a Graph message resource — subject, body (HTML
-    preferred), recipients, and attachments. `from`/timestamps are not set:
-    Graph forces `from` to the mailbox owner on JSON create, and received/sent
-    timestamps are read-only on create."""
+    Parses the MIME into a Graph message resource preserving as much fidelity as
+    Graph allows on create: subject, body (HTML preferred), recipients, sender,
+    reply-to, message id, and sent/received timestamps, plus attachments. If Graph
+    rejects the writable-on-create identity/timestamp fields (tenant policy
+    varies), retry with a minimal body so the message still migrates."""
     msg = email.message_from_bytes(raw_mime, policy=policy.default)
+    path = f"/users/{ms_user_id}/mailFolders/{folder_id}/messages"
+
+    try:
+        result = gc.post(path, user_key=ms_user_id, json=_mime_to_graph_message(msg, fidelity=True))
+        return str(result["id"])
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 400:
+            raise
+        log.warning(
+            "JSON create rejected fidelity fields (from/sender/dates); "
+            "retrying with minimal message body"
+        )
+    result = gc.post(path, user_key=ms_user_id, json=_mime_to_graph_message(msg, fidelity=False))
+    return str(result["id"])
+
+
+def _mime_to_graph_message(msg: Any, *, fidelity: bool) -> dict[str, Any]:
+    """Build a Graph message resource from a parsed email message.
+
+    With ``fidelity=True`` includes the identity/timestamp fields that are
+    writable on create (from/sender/replyTo/internetMessageId/sent+received
+    DateTime); with ``fidelity=False`` only the always-accepted content fields."""
     body, attachments = _graph_body_and_attachments(msg)
     graph_msg: dict[str, Any] = {
         "subject": str(msg["Subject"] or ""),
@@ -244,12 +267,39 @@ def _import_via_json(gc: GraphClient, ms_user_id: str, folder_id: str, raw_mime:
     }
     if attachments:
         graph_msg["attachments"] = attachments
-    result = gc.post(
-        f"/users/{ms_user_id}/mailFolders/{folder_id}/messages",
-        user_key=ms_user_id,
-        json=graph_msg,
-    )
-    return str(result["id"])
+    if not fidelity:
+        return graph_msg
+
+    if (frm := _graph_recipients(msg, "From")):
+        graph_msg["from"] = frm[0]
+    if (sender := _graph_recipients(msg, "Sender")):
+        graph_msg["sender"] = sender[0]
+    if (reply_to := _graph_recipients(msg, "Reply-To")):
+        graph_msg["replyTo"] = reply_to
+    if msg["Message-ID"]:
+        graph_msg["internetMessageId"] = str(msg["Message-ID"]).strip()
+    if (sent := _parse_internet_date(msg["Date"])):
+        graph_msg["sentDateTime"] = sent
+        graph_msg["receivedDateTime"] = sent
+    return graph_msg
+
+
+def _parse_internet_date(value: Any) -> str | None:
+    """RFC 2822 date header -> ISO 8601 string (with offset) for Graph, or None."""
+    if not value:
+        return None
+    from datetime import UTC
+    from email.utils import parsedate_to_datetime
+
+    try:
+        dt = parsedate_to_datetime(str(value))
+    except (TypeError, ValueError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.isoformat()
 
 
 def _graph_recipients(msg: Any, header: str) -> list[dict[str, Any]]:
