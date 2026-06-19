@@ -82,24 +82,40 @@ class _FlakyGC:
         return {"id": f"msg-{self.calls}"}
 
 
-def test_fallback_retries_with_reserialized_mime(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fallback_retries_with_cleaned_mime(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "migrator.microsoft.mail._rebuild_mime", lambda _raw: b"REBUILT\r\n\r\nbody\r\n"
+        "migrator.microsoft.mail._cleaned_mime", lambda _raw: b"CLEANED\r\n\r\nbody\r\n"
     )
-    gc = _FlakyGC(fail_first=1)
+    gc = _FlakyGC(fail_first=1)  # original 400s, cleaned retry succeeds
     dest = import_mime_message(gc, "u", "inbox", b"From: a\nSubject: hi\n\nbody\n")  # type: ignore[arg-type]
     assert dest == "msg-2"
     assert gc.calls == 2
-    assert base64.b64decode(gc.posted[1]) == b"REBUILT\r\n\r\nbody\r\n"
+    assert base64.b64decode(gc.posted[1]) == b"CLEANED\r\n\r\nbody\r\n"
 
 
-def test_fallback_gives_up_when_rebuild_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Re-serialization produced identical bytes — nothing to gain, re-raise the 400.
-    monkeypatch.setattr("migrator.microsoft.mail._rebuild_mime", lambda raw: raw)
-    gc = _FlakyGC(fail_first=99)
-    with pytest.raises(httpx.HTTPStatusError):
-        import_mime_message(gc, "u", "inbox", b"From: a\nSubject: hi\n\nbody\n")  # type: ignore[arg-type]
-    assert gc.calls == 1
+def test_falls_back_to_json_when_cleanup_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Cleanup can't help (returns None) -> JSON create is the last resort.
+    monkeypatch.setattr("migrator.microsoft.mail._cleaned_mime", lambda _raw: None)
+    monkeypatch.setattr(
+        "migrator.microsoft.mail._import_via_json", lambda _gc, _u, _f, _raw: "json-id"
+    )
+    gc = _FlakyGC(fail_first=1)
+    dest = import_mime_message(gc, "u", "inbox", b"From: a\nSubject: hi\n\nbody\n")  # type: ignore[arg-type]
+    assert dest == "json-id"
+    assert gc.calls == 1  # only the original MIME post was attempted on gc
+
+
+def test_falls_back_to_json_when_cleaned_also_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "migrator.microsoft.mail._cleaned_mime", lambda _raw: b"CLEANED\r\n\r\nbody\r\n"
+    )
+    monkeypatch.setattr(
+        "migrator.microsoft.mail._import_via_json", lambda _gc, _u, _f, _raw: "json-id"
+    )
+    gc = _FlakyGC(fail_first=2)  # both original and cleaned 400
+    dest = import_mime_message(gc, "u", "inbox", b"From: a\nSubject: hi\n\nbody\n")  # type: ignore[arg-type]
+    assert dest == "json-id"
+    assert gc.calls == 2  # original + cleaned, then JSON (mocked)
 
 
 def test_non_deserialize_400_propagates_without_fallback() -> None:
@@ -113,3 +129,62 @@ def test_non_deserialize_400_propagates_without_fallback() -> None:
 
     with pytest.raises(httpx.HTTPStatusError):
         import_mime_message(_GC(), "u", "inbox", b"From: a\n\nbody\n")  # type: ignore[arg-type]
+
+
+def test_cleaned_mime_strips_trace_headers() -> None:
+    from migrator.microsoft.mail import _cleaned_mime
+
+    raw = (
+        b"Received: by 10.0.0.1 with very long trace data\r\n"
+        b"DKIM-Signature: a=rsa; b=AAAABBBBCCCC\r\n"
+        b"From: alice@x.com\r\n"
+        b"To: bob@y.com\r\n"
+        b"Subject: hi\r\n"
+        b"\r\n"
+        b"body\r\n"
+    )
+    cleaned = _cleaned_mime(raw)
+    assert cleaned is not None
+    assert b"Received:" not in cleaned
+    assert b"DKIM-Signature:" not in cleaned
+    assert b"From: alice@x.com" in cleaned
+    assert b"Subject: hi" in cleaned
+    assert b"body" in cleaned
+
+
+def test_import_via_json_builds_message() -> None:
+    from email.message import EmailMessage
+
+    from migrator.microsoft.mail import _import_via_json
+
+    m = EmailMessage()
+    m["Subject"] = "Hello"
+    m["From"] = "Alice <alice@x.com>"
+    m["To"] = "Bob <bob@y.com>, carol@z.com"
+    m["Cc"] = "dan@w.com"
+    m.set_content("plain body")
+    m.add_alternative("<p>html body</p>", subtype="html")
+    m.add_attachment(b"FILEDATA", maintype="application", subtype="octet-stream", filename="f.bin")
+
+    class _JsonGC:
+        def __init__(self) -> None:
+            self.json: dict[str, object] | None = None
+
+        def post(self, path: str, user_key: str | None = None, **kwargs: object) -> dict[str, str]:
+            self.json = kwargs.get("json")  # type: ignore[assignment]
+            return {"id": "j1"}
+
+    gc = _JsonGC()
+    dest = _import_via_json(gc, "u", "inbox", m.as_bytes())  # type: ignore[arg-type]
+    assert dest == "j1"
+    gm = gc.json
+    assert gm is not None
+    assert gm["subject"] == "Hello"
+    assert gm["body"]["contentType"] == "html"  # type: ignore[index]
+    assert "html body" in gm["body"]["content"]  # type: ignore[index]
+    assert len(gm["toRecipients"]) == 2  # type: ignore[arg-type]
+    assert len(gm["ccRecipients"]) == 1  # type: ignore[arg-type]
+    attachments = gm["attachments"]  # type: ignore[index]
+    assert len(attachments) == 1
+    assert attachments[0]["name"] == "f.bin"
+    assert base64.b64decode(attachments[0]["contentBytes"]) == b"FILEDATA"

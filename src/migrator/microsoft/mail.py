@@ -62,19 +62,43 @@ def ensure_mail_folder(
     display_name: str,
     parent_folder_id: str | None = None,
 ) -> str:
-    """Return the ID of the named folder, creating it (and parent chain) if absent."""
+    """Return the ID of the named folder, creating it if absent.
+
+    Lists existing folders with pagination: Graph returns only 10 folders per
+    page by default, so a single naive GET misses any folder past the first page
+    and then 409s (ErrorFolderExists) on create. On a 409 (paging miss or a
+    concurrent create) we re-resolve and return the existing folder's id."""
     if parent_folder_id:
         path = f"/users/{ms_user_id}/mailFolders/{parent_folder_id}/childFolders"
     else:
         path = f"/users/{ms_user_id}/mailFolders"
 
-    existing = gc.get(path, user_key=ms_user_id)
-    for folder in existing.get("value", []):
-        if folder["displayName"] == display_name:
-            return str(folder["id"])
+    existing = _find_folder_by_name(gc, ms_user_id, path, display_name)
+    if existing:
+        return existing
 
-    created = gc.post(path, user_key=ms_user_id, json={"displayName": display_name})
-    return str(created["id"])
+    try:
+        created = gc.post(path, user_key=ms_user_id, json={"displayName": display_name})
+        return str(created["id"])
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 409:
+            raise
+        resolved = _find_folder_by_name(gc, ms_user_id, path, display_name)
+        if resolved:
+            return resolved
+        raise
+
+
+def _find_folder_by_name(
+    gc: GraphClient, ms_user_id: str, path: str, display_name: str
+) -> str | None:
+    for page in gc.paginate(
+        path, user_key=ms_user_id, params={"$top": 100, "$select": "id,displayName"}
+    ):
+        for folder in page:
+            if folder.get("displayName") == display_name:
+                return str(folder["id"])
+    return None
 
 
 def import_mime_message(
@@ -109,11 +133,28 @@ def import_mime_message(
         if not _is_deserialize_400(exc):
             raise
         _log_mime_diagnostic(raw_mime)
-        rebuilt = _rebuild_mime(raw_mime)
-        if rebuilt is None or rebuilt == raw_mime:
-            raise
-        log.warning("Retrying import with re-serialized MIME (%d bytes)", len(rebuilt))
-        return _import_mime(gc, ms_user_id, folder_id, rebuilt)
+
+    # Graph couldn't parse the raw MIME. Strip Gmail's bulky trace/auth headers
+    # (Received/ARC/DKIM/X-Google-* — their long, often unfoldable lines are the
+    # usual cause) and re-serialize to RFC-conformant bytes. This keeps full MIME
+    # fidelity for from/date/recipients/body/attachments.
+    cleaned = _cleaned_mime(raw_mime)
+    if cleaned is not None and cleaned != raw_mime:
+        try:
+            log.warning("Retrying import with trace headers stripped (%d bytes)", len(cleaned))
+            return _import_mime(gc, ms_user_id, folder_id, cleaned)
+        except httpx.HTTPStatusError as exc:
+            if not _is_deserialize_400(exc):
+                raise
+
+    # Last resort: build the message via the JSON API. Graph sets `from` to the
+    # mailbox owner (original sender/timestamps not preserved), but the message
+    # content, recipients, and attachments are migrated rather than dropped.
+    log.warning(
+        "MIME import failed after cleanup; falling back to JSON message create "
+        "(sender/timestamp fidelity lost)"
+    )
+    return _import_via_json(gc, ms_user_id, folder_id, raw_mime)
 
 
 def _import_mime(gc: GraphClient, ms_user_id: str, folder_id: str, raw_mime: bytes) -> str:
@@ -135,16 +176,132 @@ def _is_deserialize_400(exc: httpx.HTTPStatusError) -> bool:
     )
 
 
-def _rebuild_mime(raw_mime: bytes) -> bytes | None:
-    """Re-serialize the message through the email engine to produce RFC-conformant
-    bytes (CRLF, refolded headers, regenerated boundaries). Returns None if the
-    message can't be parsed at all."""
+# Gmail/transit trace + auth headers. They carry no mailbox value and their long,
+# frequently unfoldable lines are the usual trigger for Graph's MIME deserializer
+# to reject an otherwise-clean message. Stripped before the cleanup retry.
+_TRACE_HEADERS = frozenset(
+    {
+        "received",
+        "received-spf",
+        "arc-seal",
+        "arc-message-signature",
+        "arc-authentication-results",
+        "dkim-signature",
+        "x-google-dkim-signature",
+        "authentication-results",
+        "authentication-results-original",
+        "x-forwarded-encrypted",
+        "x-forwarded-for",
+        "x-forwarded-to",
+        "x-received",
+        "x-google-smtp-source",
+        "x-gm-message-state",
+        "x-gm-gmsgid",
+        "x-gm-thrid",
+        "x-gm-labels",
+        "x-spam-status",
+        "x-spam-score",
+        "x-spam-flag",
+        "x-spam-checker-version",
+    }
+)
+
+
+def _cleaned_mime(raw_mime: bytes) -> bytes | None:
+    """Strip bulky trace/auth headers and re-serialize to RFC-conformant bytes.
+
+    Returns None if the message can't be parsed. The remaining headers and all
+    body parts are preserved, so from/date/recipients/body/attachments survive."""
     try:
         msg = email.message_from_bytes(raw_mime, policy=policy.SMTP)
-        return msg.as_bytes(policy=policy.SMTP)
-    except Exception as exc:  # noqa: BLE001 - diagnostic best-effort
-        log.warning("Could not re-serialize MIME for fallback: %s", exc)
+    except Exception as exc:  # noqa: BLE001 - best-effort fallback
+        log.warning("Could not parse MIME for cleanup fallback: %s", exc)
         return None
+    for name in {k.lower() for k in msg.keys()} & _TRACE_HEADERS:
+        del msg[name]
+    try:
+        return msg.as_bytes(policy=policy.SMTP)
+    except Exception as exc:  # noqa: BLE001 - best-effort fallback
+        log.warning("Could not re-serialize cleaned MIME: %s", exc)
+        return None
+
+
+def _import_via_json(gc: GraphClient, ms_user_id: str, folder_id: str, raw_mime: bytes) -> str:
+    """Create the message via the JSON message API (MIME-import last resort).
+
+    Parses the MIME into a Graph message resource — subject, body (HTML
+    preferred), recipients, and attachments. `from`/timestamps are not set:
+    Graph forces `from` to the mailbox owner on JSON create, and received/sent
+    timestamps are read-only on create."""
+    msg = email.message_from_bytes(raw_mime, policy=policy.default)
+    body, attachments = _graph_body_and_attachments(msg)
+    graph_msg: dict[str, Any] = {
+        "subject": str(msg["Subject"] or ""),
+        "body": body,
+        "toRecipients": _graph_recipients(msg, "To"),
+        "ccRecipients": _graph_recipients(msg, "Cc"),
+        "bccRecipients": _graph_recipients(msg, "Bcc"),
+    }
+    if attachments:
+        graph_msg["attachments"] = attachments
+    result = gc.post(
+        f"/users/{ms_user_id}/mailFolders/{folder_id}/messages",
+        user_key=ms_user_id,
+        json=graph_msg,
+    )
+    return str(result["id"])
+
+
+def _graph_recipients(msg: Any, header: str) -> list[dict[str, Any]]:
+    from email.utils import getaddresses
+
+    out: list[dict[str, Any]] = []
+    for name, addr in getaddresses(msg.get_all(header, [])):
+        if not addr or "@" not in addr:
+            continue
+        ea: dict[str, str] = {"address": addr}
+        if name:
+            ea["name"] = name
+        out.append({"emailAddress": ea})
+    return out
+
+
+def _graph_body_and_attachments(msg: Any) -> tuple[dict[str, str], list[dict[str, Any]]]:
+    html_parts: list[str] = []
+    text_parts: list[str] = []
+    attachments: list[dict[str, Any]] = []
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        ctype = part.get_content_type()
+        disp = part.get_content_disposition()
+        filename = part.get_filename()
+        is_attachment = disp == "attachment" or bool(filename) or (
+            disp == "inline" and not ctype.startswith("text/")
+        )
+        if is_attachment:
+            try:
+                data: bytes = part.get_payload(decode=True) or b""
+            except Exception:  # noqa: BLE001 - skip undecodable part content
+                data = b""
+            att: dict[str, Any] = {
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": filename or "attachment",
+                "contentType": ctype or "application/octet-stream",
+                "contentBytes": base64.b64encode(data).decode(),
+            }
+            cid = part.get("Content-ID")
+            if cid:
+                att["isInline"] = True
+                att["contentId"] = str(cid).strip("<>")
+            attachments.append(att)
+        elif ctype == "text/html":
+            html_parts.append(str(part.get_content()))
+        elif ctype == "text/plain":
+            text_parts.append(str(part.get_content()))
+    if html_parts:
+        return {"contentType": "html", "content": "".join(html_parts)}, attachments
+    return {"contentType": "text", "content": "".join(text_parts)}, attachments
 
 
 def _log_mime_diagnostic(raw_mime: bytes) -> None:
@@ -154,10 +311,12 @@ def _log_mime_diagnostic(raw_mime: bytes) -> None:
     has_bare_lf = b"\n" in raw_mime.replace(b"\r\n", b"")
     non_ascii = any(b > 127 for b in raw_mime)
     has_8bit_cte = b"content-transfer-encoding: 8bit" in raw_mime[:8192].lower()
+    max_line_len = max((len(line) for line in raw_mime.split(b"\r\n")), default=0)
     log.warning(
-        "MIME rejected by Graph (size=%d, bare_lf=%s, non_ascii=%s, 8bit_cte=%s). "
-        "Head: %r",
+        "MIME rejected by Graph (size=%d, max_line=%d, bare_lf=%s, non_ascii=%s, "
+        "8bit_cte=%s). Head: %r",
         len(raw_mime),
+        max_line_len,
         has_bare_lf,
         non_ascii,
         has_8bit_cte,
