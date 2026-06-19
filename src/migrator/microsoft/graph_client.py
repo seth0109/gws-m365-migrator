@@ -24,8 +24,22 @@ _MAX_RETRIES = 7
 
 def _is_retryable(exc: BaseException) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code in (429, 500, 502, 503, 504)
-    return isinstance(exc, (httpx.TimeoutException, httpx.NetworkError))
+        code = exc.response.status_code
+        if code in (429, 500, 502, 503, 504):
+            return True
+        # A 400 UnableToDeserializePostBody is almost always a poisoned keep-alive
+        # connection (a prior request left the socket in a bad state), not a real
+        # body problem — empty/bad bodies are guarded before they reach here. Retry
+        # it; the before-sleep hook drops the connection so we redial fresh.
+        if code == 400 and "UnableToDeserializePostBody" in exc.response.text:
+            return True
+        return False
+    # RemoteProtocolError ("Server disconnected"/"connection closed") is the other
+    # face of a half-closed pooled connection under sustained load — also retryable.
+    return isinstance(
+        exc,
+        (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError),
+    )
 
 
 class ThrottledError(Exception):
@@ -47,7 +61,22 @@ class GraphClient:
         self._token_provider = token_provider
         self._global_limiter_name = global_limiter_name
         self._per_user_limiter = per_user_limiter
+        self._timeout = timeout
         self._client = httpx.Client(timeout=timeout)
+
+    def _reset_transport(self) -> None:
+        """Drop all pooled connections and start a fresh client.
+
+        Called between retries: if a request failed because its keep-alive
+        connection was half-closed by the server (the cause of a cascade of
+        UnableToDeserializePostBody / RemoteProtocolError failures), reusing the
+        pool would just hit the same dead socket. A new client redials clean.
+        Safe per-thread: each GraphClient is owned by a single worker thread."""
+        try:
+            self._client.close()
+        except Exception:  # noqa: BLE001 - best-effort teardown of a bad client
+            pass
+        self._client = httpx.Client(timeout=self._timeout)
 
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         headers = {
@@ -76,10 +105,16 @@ class GraphClient:
         self._apply_rate_limits(user_key)
         extra_headers = kwargs.pop("headers", None)
 
+        def _redial(_retry_state: Any) -> None:
+            # Connection-level failure (server-disconnect, deserialize-400 from a
+            # poisoned socket): discard the pool so the next attempt redials clean.
+            self._reset_transport()
+
         @retry(
             retry=retry_if_exception(_is_retryable),
             stop=stop_after_attempt(_MAX_RETRIES),
             wait=wait_exponential(multiplier=1, min=2, max=60),
+            before_sleep=_redial,
             reraise=True,
         )
         def _do() -> httpx.Response:
@@ -96,15 +131,23 @@ class GraphClient:
                 # raise_for_status() drops them, so surface it before re-raising.
                 # Also echo the outgoing JSON body (truncated) — invaluable for
                 # UnableToDeserializePostBody and other body-shape rejections.
-                # Skip raw `content=` payloads (MIME / file bytes) to avoid dumping MBs.
+                # Skip raw `content=` payloads (MIME / file bytes) to avoid dumping MBs,
+                # but still report their size — a 0-byte body is the usual cause of
+                # UnableToDeserializePostBody on MIME import.
                 req_body = kwargs.get("json")
+                if req_body is not None:
+                    body_desc = repr(req_body)[:2000]
+                elif (content := kwargs.get("content")) is not None:
+                    body_desc = f"<non-JSON body, {len(content)} bytes>"
+                else:
+                    body_desc = "<no body>"
                 log.error(
-                    "Graph %s %s → %s: %s | request json: %s",
+                    "Graph %s %s -> %s: %s | request body: %s",
                     method,
                     url,
                     resp.status_code,
                     resp.text,
-                    repr(req_body)[:2000] if req_body is not None else "<non-JSON body>",
+                    body_desc,
                 )
             resp.raise_for_status()
             return resp

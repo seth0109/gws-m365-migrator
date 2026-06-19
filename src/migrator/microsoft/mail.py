@@ -87,6 +87,10 @@ def import_mime_message(
     messages are imported with their bulk attachments stripped out, then those
     attachments are re-added via the attachment APIs (upload session for parts
     over 3 MB) so the body/headers keep full MIME fidelity."""
+    if not raw_mime:
+        # An empty body POSTs as "" and Graph rejects it with the opaque
+        # UnableToDeserializePostBody 400. Fail with a clear reason instead.
+        raise ValueError("source returned empty MIME body; nothing to import")
     if len(raw_mime) <= _MAX_MIME_SINGLE_POST:
         return _post_mime(gc, ms_user_id, folder_id, raw_mime)
 

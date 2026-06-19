@@ -25,7 +25,9 @@ _WORKLOAD_ORDER = ("contacts", "calendar", "files", "mail")
 def _setup_logging(level: str, log_file: Path | None) -> None:
     handlers: list[logging.Handler] = [RichHandler(rich_tracebacks=True)]
     if log_file:
-        handlers.append(logging.FileHandler(log_file))
+        # utf-8 so unicode in log messages (e.g. the "→" arrow) doesn't crash the
+        # handler on Windows, where FileHandler otherwise defaults to cp1252.
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
     logging.basicConfig(level=level, handlers=handlers, format="%(message)s", datefmt="[%X]")
 
 
