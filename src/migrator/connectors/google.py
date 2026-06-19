@@ -355,8 +355,11 @@ def _map_event(event: dict[str, Any]) -> dict[str, Any]:
         body["start"] = {"dateTime": start["dateTime"], "timeZone": start.get("timeZone", "UTC")}
         body["end"] = {"dateTime": end["dateTime"], "timeZone": end.get("timeZone", "UTC")}
     else:
-        body["start"] = {"date": start["date"]}
-        body["end"] = {"date": end["date"]}
+        # All-day events: Graph has no date-only shape — start/end must be
+        # dateTimeTimeZone objects at midnight (with isAllDay=true), not Google's
+        # bare {"date": ...}. Sending the latter fails with UnableToDeserializePostBody.
+        body["start"] = {"dateTime": f"{start['date']}T00:00:00", "timeZone": "UTC"}
+        body["end"] = {"dateTime": f"{end['date']}T00:00:00", "timeZone": "UTC"}
         body["isAllDay"] = True
 
     location = event.get("location", "")

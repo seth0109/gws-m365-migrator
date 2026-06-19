@@ -94,8 +94,17 @@ class GraphClient:
             if resp.status_code >= 400:
                 # Graph 4xx/5xx bodies carry the real reason (error.code/message);
                 # raise_for_status() drops them, so surface it before re-raising.
+                # Also echo the outgoing JSON body (truncated) — invaluable for
+                # UnableToDeserializePostBody and other body-shape rejections.
+                # Skip raw `content=` payloads (MIME / file bytes) to avoid dumping MBs.
+                req_body = kwargs.get("json")
                 log.error(
-                    "Graph %s %s → %s: %s", method, url, resp.status_code, resp.text
+                    "Graph %s %s → %s: %s | request json: %s",
+                    method,
+                    url,
+                    resp.status_code,
+                    resp.text,
+                    repr(req_body)[:2000] if req_body is not None else "<non-JSON body>",
                 )
             resp.raise_for_status()
             return resp
