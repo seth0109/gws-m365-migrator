@@ -91,6 +91,12 @@ class GraphClient:
                 log.warning("Graph 429 on %s — sleeping %ss", url, retry_after)
                 time.sleep(retry_after)
                 resp.raise_for_status()  # trigger tenacity retry
+            if resp.status_code >= 400:
+                # Graph 4xx/5xx bodies carry the real reason (error.code/message);
+                # raise_for_status() drops them, so surface it before re-raising.
+                log.error(
+                    "Graph %s %s → %s: %s", method, url, resp.status_code, resp.text
+                )
             resp.raise_for_status()
             return resp
 
