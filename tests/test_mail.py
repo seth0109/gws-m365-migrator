@@ -131,6 +131,52 @@ def test_non_deserialize_400_propagates_without_fallback() -> None:
         import_mime_message(_GC(), "u", "inbox", b"From: a\n\nbody\n")  # type: ignore[arg-type]
 
 
+def test_header_line_stats_finds_longest_lines() -> None:
+    from migrator.microsoft.mail import _header_line_stats
+
+    raw = (
+        b"From: a@x.com\r\n"
+        b"DKIM-Signature: " + b"A" * 3000 + b"\r\n"
+        b"Subject: hi\r\n"
+        b"\r\n"
+        b"body\r\n"
+    )
+    stats = _header_line_stats(raw)
+    assert stats[0][0] == "DKIM-Signature"
+    assert stats[0][1] > 998
+
+
+def test_header_line_stats_counts_folded_continuation() -> None:
+    from migrator.microsoft.mail import _header_line_stats
+
+    raw = (
+        b"References: <a>\r\n " + b"B" * 2000 + b"\r\n"
+        b"Subject: hi\r\n\r\nbody\r\n"
+    )
+    stats = dict(_header_line_stats(raw))
+    assert stats["References"] > 1998
+
+
+def test_maybe_dump_rejected_writes_file(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import migrator.microsoft.mail as mailmod
+
+    monkeypatch.setenv("MIGRATOR_DUMP_REJECTED_MIME", str(tmp_path))
+    monkeypatch.setattr(mailmod, "_dump_count", 0)
+    mailmod._maybe_dump_rejected(b"From: a\r\n\r\nbody\r\n")
+    dumps = list(tmp_path.glob("rejected_mime_*.eml"))
+    assert len(dumps) == 1
+    assert dumps[0].read_bytes() == b"From: a\r\n\r\nbody\r\n"
+
+
+def test_maybe_dump_rejected_noop_without_env(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import migrator.microsoft.mail as mailmod
+
+    monkeypatch.delenv("MIGRATOR_DUMP_REJECTED_MIME", raising=False)
+    monkeypatch.setattr(mailmod, "_dump_count", 0)
+    mailmod._maybe_dump_rejected(b"From: a\r\n\r\nbody\r\n")
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_cleaned_mime_strips_trace_headers() -> None:
     from migrator.microsoft.mail import _cleaned_mime
 

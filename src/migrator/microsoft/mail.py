@@ -3,7 +3,10 @@ from __future__ import annotations
 import base64
 import email
 import logging
+import os
+import threading
 from email import policy
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -11,6 +14,13 @@ import httpx
 from .graph_client import GraphClient
 
 log = logging.getLogger(__name__)
+
+# Debug knob: set MIGRATOR_DUMP_REJECTED_MIME=<dir> to have the first few MIME
+# messages Graph rejects written there as .eml files for offline inspection.
+_DUMP_DIR_ENV = "MIGRATOR_DUMP_REJECTED_MIME"
+_MAX_DUMPS = 5
+_dump_lock = threading.Lock()
+_dump_count = 0
 
 # System label → well-known Outlook folder name
 SYSTEM_FOLDER_MAP = {
@@ -354,24 +364,70 @@ def _graph_body_and_attachments(msg: Any) -> tuple[dict[str, str], list[dict[str
     return {"contentType": "text", "content": "".join(text_parts)}, attachments
 
 
+def _header_line_stats(raw_mime: bytes) -> list[tuple[str, int]]:
+    """Return (header-name, longest-physical-line) for the headers with the longest
+    lines — non-sensitive (names + lengths only). RFC 5322 caps a line at 998
+    octets; anything well above that is a prime suspect for Graph's rejection."""
+    header_blob = raw_mime.split(b"\r\n\r\n", 1)[0]
+    headers: list[tuple[str, int]] = []
+    cur_name: str | None = None
+    cur_max = 0
+    for line in header_blob.split(b"\r\n"):
+        if line[:1] in (b" ", b"\t") and cur_name is not None:  # folded continuation
+            cur_max = max(cur_max, len(line))
+            continue
+        if cur_name is not None:
+            headers.append((cur_name, cur_max))
+        cur_name = line.split(b":", 1)[0].decode("latin-1", "replace")[:40]
+        cur_max = len(line)
+    if cur_name is not None:
+        headers.append((cur_name, cur_max))
+    headers.sort(key=lambda h: h[1], reverse=True)
+    return headers[:5]
+
+
+def _maybe_dump_rejected(raw_mime: bytes) -> None:
+    """If MIGRATOR_DUMP_REJECTED_MIME is set, write the first few rejected messages
+    there as .eml files for offline inspection (capped, thread-safe)."""
+    dump_dir = os.environ.get(_DUMP_DIR_ENV)
+    if not dump_dir:
+        return
+    global _dump_count
+    with _dump_lock:
+        if _dump_count >= _MAX_DUMPS:
+            return
+        idx = _dump_count
+        _dump_count += 1
+    try:
+        target = Path(dump_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        path = target / f"rejected_mime_{idx}.eml"
+        path.write_bytes(raw_mime)
+        log.warning("Wrote rejected MIME to %s for inspection", path)
+    except OSError as exc:
+        log.warning("Could not write rejected MIME dump: %s", exc)
+
+
 def _log_mime_diagnostic(raw_mime: bytes) -> None:
-    """Surface what Graph choked on: the message's leading bytes (headers) plus a
-    few structural flags. The Graph 400 body itself is uninformative."""
-    head = raw_mime[:400]
+    """Surface what Graph choked on: structural flags plus the headers with the
+    longest lines (names + lengths, no content). The Graph 400 body itself is
+    uninformative. Optionally dumps the raw message (see _maybe_dump_rejected)."""
     has_bare_lf = b"\n" in raw_mime.replace(b"\r\n", b"")
     non_ascii = any(b > 127 for b in raw_mime)
     has_8bit_cte = b"content-transfer-encoding: 8bit" in raw_mime[:8192].lower()
     max_line_len = max((len(line) for line in raw_mime.split(b"\r\n")), default=0)
+    longest_headers = "; ".join(f"{name}={length}" for name, length in _header_line_stats(raw_mime))
     log.warning(
         "MIME rejected by Graph (size=%d, max_line=%d, bare_lf=%s, non_ascii=%s, "
-        "8bit_cte=%s). Head: %r",
+        "8bit_cte=%s). Longest header lines: %s",
         len(raw_mime),
         max_line_len,
         has_bare_lf,
         non_ascii,
         has_8bit_cte,
-        head,
+        longest_headers,
     )
+    _maybe_dump_rejected(raw_mime)
 
 
 def _normalize_crlf(raw: bytes) -> bytes:
