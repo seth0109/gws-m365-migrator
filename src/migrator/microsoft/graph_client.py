@@ -24,18 +24,10 @@ _MAX_RETRIES = 7
 
 def _is_retryable(exc: BaseException) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
-        code = exc.response.status_code
-        if code in (429, 500, 502, 503, 504):
-            return True
-        # A 400 UnableToDeserializePostBody is almost always a poisoned keep-alive
-        # connection (a prior request left the socket in a bad state), not a real
-        # body problem — empty/bad bodies are guarded before they reach here. Retry
-        # it; the before-sleep hook drops the connection so we redial fresh.
-        if code == 400 and "UnableToDeserializePostBody" in exc.response.text:
-            return True
-        return False
-    # RemoteProtocolError ("Server disconnected"/"connection closed") is the other
-    # face of a half-closed pooled connection under sustained load — also retryable.
+        return exc.response.status_code in (429, 500, 502, 503, 504)
+    # RemoteProtocolError ("Server disconnected"/"connection closed") is the
+    # face of a half-closed pooled connection under sustained load — retryable,
+    # and the before-sleep hook drops the pool so the retry redials fresh.
     return isinstance(
         exc,
         (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError),

@@ -6,6 +6,8 @@ import logging
 from email import policy
 from typing import Any
 
+import httpx
+
 from .graph_client import GraphClient
 
 log = logging.getLogger(__name__)
@@ -86,7 +88,13 @@ def import_mime_message(
     Messages under Graph's 4 MB MIME request cap are posted directly. Larger
     messages are imported with their bulk attachments stripped out, then those
     attachments are re-added via the attachment APIs (upload session for parts
-    over 3 MB) so the body/headers keep full MIME fidelity."""
+    over 3 MB) so the body/headers keep full MIME fidelity.
+
+    If Graph rejects the raw MIME with UnableToDeserializePostBody (a malformed
+    or non-conformant message it can't parse), we log a diagnostic of the
+    offending content and retry once with the message re-serialized through
+    Python's email engine (policy.SMTP), which rebuilds RFC-conformant headers,
+    boundaries, and CRLF endings."""
     if not raw_mime:
         # An empty body POSTs as "" and Graph rejects it with the opaque
         # UnableToDeserializePostBody 400. Fail with a clear reason instead.
@@ -95,6 +103,21 @@ def import_mime_message(
     # send (CRLF expansion grows the message); _post_mime re-normalizes too, since
     # the large-attachment path re-serializes back to bare LF.
     raw_mime = _normalize_crlf(raw_mime)
+    try:
+        return _import_mime(gc, ms_user_id, folder_id, raw_mime)
+    except httpx.HTTPStatusError as exc:
+        if not _is_deserialize_400(exc):
+            raise
+        _log_mime_diagnostic(raw_mime)
+        rebuilt = _rebuild_mime(raw_mime)
+        if rebuilt is None or rebuilt == raw_mime:
+            raise
+        log.warning("Retrying import with re-serialized MIME (%d bytes)", len(rebuilt))
+        return _import_mime(gc, ms_user_id, folder_id, rebuilt)
+
+
+def _import_mime(gc: GraphClient, ms_user_id: str, folder_id: str, raw_mime: bytes) -> str:
+    """Core MIME import: single POST under the cap, else strip-and-reattach."""
     if len(raw_mime) <= _MAX_MIME_SINGLE_POST:
         return _post_mime(gc, ms_user_id, folder_id, raw_mime)
 
@@ -103,6 +126,43 @@ def import_mime_message(
     for name, content_type, data in attachments:
         _add_attachment(gc, ms_user_id, message_id, name, content_type, data)
     return message_id
+
+
+def _is_deserialize_400(exc: httpx.HTTPStatusError) -> bool:
+    return (
+        exc.response.status_code == 400
+        and "UnableToDeserializePostBody" in exc.response.text
+    )
+
+
+def _rebuild_mime(raw_mime: bytes) -> bytes | None:
+    """Re-serialize the message through the email engine to produce RFC-conformant
+    bytes (CRLF, refolded headers, regenerated boundaries). Returns None if the
+    message can't be parsed at all."""
+    try:
+        msg = email.message_from_bytes(raw_mime, policy=policy.SMTP)
+        return msg.as_bytes(policy=policy.SMTP)
+    except Exception as exc:  # noqa: BLE001 - diagnostic best-effort
+        log.warning("Could not re-serialize MIME for fallback: %s", exc)
+        return None
+
+
+def _log_mime_diagnostic(raw_mime: bytes) -> None:
+    """Surface what Graph choked on: the message's leading bytes (headers) plus a
+    few structural flags. The Graph 400 body itself is uninformative."""
+    head = raw_mime[:400]
+    has_bare_lf = b"\n" in raw_mime.replace(b"\r\n", b"")
+    non_ascii = any(b > 127 for b in raw_mime)
+    has_8bit_cte = b"content-transfer-encoding: 8bit" in raw_mime[:8192].lower()
+    log.warning(
+        "MIME rejected by Graph (size=%d, bare_lf=%s, non_ascii=%s, 8bit_cte=%s). "
+        "Head: %r",
+        len(raw_mime),
+        has_bare_lf,
+        non_ascii,
+        has_8bit_cte,
+        head,
+    )
 
 
 def _normalize_crlf(raw: bytes) -> bytes:

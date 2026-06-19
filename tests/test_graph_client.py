@@ -23,9 +23,10 @@ def test_throttle_and_server_errors_retry(code: int) -> None:
     assert _is_retryable(_status_error(code)) is True
 
 
-def test_deserialize_400_is_retryable() -> None:
+def test_deserialize_400_is_not_retryable() -> None:
+    # Content-based, not transient — handled (logged + fallback) at the mail layer.
     body = '{"error":{"code":"UnableToDeserializePostBody","message":"were unable to..."}}'
-    assert _is_retryable(_status_error(400, body)) is True
+    assert _is_retryable(_status_error(400, body)) is False
 
 
 def test_plain_400_is_not_retryable() -> None:
