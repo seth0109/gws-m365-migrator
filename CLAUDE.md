@@ -16,7 +16,7 @@ pytest                          # Run all tests
 pytest tests/ -v               # Verbose output
 pytest tests/test_foo.py -k test_name  # Single test
 ```
-pytest configured in pyproject.toml with testpaths=["tests"]. `tests/test_multi_source.py` covers the pure (no-network) logic: config discrimination, source factory dispatch, capability gating, IMAP folder mapping, and manifest columns.
+pytest configured in pyproject.toml with testpaths=["tests"]. All tests are pure / no-network — Graph interactions are exercised through hand-rolled fake clients (`_FakeGC` / `_RecordingGC` patterns) and `httpx.MockTransport`, not live calls. Coverage: `test_multi_source.py` (config discrimination, source factory dispatch, capability gating, IMAP folder mapping, manifest columns, SharePoint flows), `test_configgen.py` (init-config scaffolding), `test_identities.py` / `test_reporting.py` (identity remap, report workload discovery), `test_mail.py` (CRLF normalization, MIME recovery ladder, JSON import + MAPI extended properties), `test_files.py` (OneDrive provisioning wait, folder ensure/409, PUT upload), `test_graph_client.py` (retry classification, transport reset, auth-header routing, pagination, per-attempt rate limiting), `test_recurrence.py` (RRULE → Graph pattern mapping), `test_sharepoint.py` (group provisioning body, nickname sanitization, poll error handling), `test_paths.py` (name sanitization), `test_contacts.py` (photo selection/upload, folder ensure), `test_calendar_exceptions.py` (occurrence matching + `_apply_exception` against a seeded state DB), `test_mail_job.py` (end-to-end run_mail: idempotent reruns, duplicate prevention, cursor gating, delta refusal).
 
 ### Linting & Formatting
 ```bash
@@ -30,6 +30,12 @@ Line length is 100. Source root is src/.
 mypy src/
 ```
 Strict mode enabled (strict = true). Python 3.11+.
+
+### Baseline state of the checks
+`pytest` is green (147 tests, ~5 s, no network). `ruff check src/` and `mypy src/` are **not** clean: there is a pre-existing baseline of 10 ruff E501s and 21 mypy errors (untyped `googleapiclient` returns in `google/*`, `Returning Any` in thin Graph writers), tracked in `TODO.md`. Treat those counts as the floor — fix what you touch, don't add new ones, and don't read the existing output as breakage you caused. Neither tool is configured over `tests/` (`src = ["src"]`, `mypy src/`).
+
+### Local artifacts (never commit)
+The CLI writes into the current working directory: `migration_state.db` (+ WAL sidecars), `migrator.log`, `.ms_token_cache.json`, `whatif_manifest.csv`, `migration_report.html`. `.gitignore` covers the credentials / state / log / token-cache set, but the **whatif manifest and validation report are not ignored and contain real mailbox subjects, file names, and user addresses** — don't stage them. `cli._setup_logging` pins the file handler to `encoding="utf-8"` because this is developed/run on Windows, where the default cp1252 encoder crashes on the `→` in log messages.
 
 ### Run the CLI Tool
 ```bash
@@ -47,7 +53,7 @@ migrator whatif --config config.yaml --output whatif_manifest.csv  # Dry-run inv
 migrator smoke-test --config config.yaml    # Phase 0 test: probe source, write+delete a dest test folder
 migrator validate --config config.yaml --output report.html  # Generate validation report
 ```
-Use `--user <source_id>` to limit any run to a single user. Per-workload commands and `run-all`/`delta`/`whatif` skip (or error on) workloads the configured source does not support — see Source Connectors. Config is YAML with a `source:` block (type `google_workspace` | `imap` | `microsoft365`), a `destination:` Microsoft 365 block, user mappings (`source_id` → `dest_id`), optional `shared_drives`, workload settings, and rate limits. See `config.example.yaml`.
+Use `--user <source_id>` to limit any *per-user* run to one user; the two tenant-level SharePoint commands take `--delta` instead. Per-workload commands and `run-all`/`delta`/`whatif` skip (or error on) workloads the configured source does not support — see Source Connectors. Typical cutover sequence: `init-config` → `smoke-test` → `whatif` → `run-all` → *(cutover)* → `delta` → `validate`. Config is YAML with a `source:` block (type `google_workspace` | `imap` | `microsoft365`), a `destination:` Microsoft 365 block, user mappings (`source_id` → `dest_id`), optional `shared_drives`, workload settings, and rate limits. See `config.example.yaml`.
 
 ## Architecture
 
@@ -60,6 +66,44 @@ The tool migrates from a pluggable **source** to a Microsoft 365 **destination**
 - **JobContext** (`context.py`): replaces the old global-config injection for per-job data. The Orchestrator builds `JobContext(user, source, dest_gc, mode, config)` per user and calls `fn(ctx)`. `ctx.require_capability(workload)` raises if the source can't do that workload. (`_current_config`/`_current_manifest` globals remain only for whatif manifest access.)
 
 **Key leverage:** every mail source emits raw MIME and `microsoft/files.py` takes a `drive_root` prefix — so the destination writers (`microsoft/{mail,files,contacts,calendar}.py`) are shared unchanged across all source types and across OneDrive vs SharePoint.
+
+**Adding a source type** — the seams, in order: a `*SourceConfig` model with a `Literal["…"] type` added to the `SourceConfig` union in `config.py` → a `BaseSource` subclass declaring `capabilities` and implementing only the `iter_*` / `inventory_*` / `fetch_*` methods for those workloads → registration in `connectors/factory.py`, both in `build_source()` **and** in the `_CAPABILITIES` table (the CLI gates on that table so it never has to build a network client) → optional `configgen.py` support for `init-config`. Nothing under `microsoft/` or `workloads/` should need to change; if it does, extend the item dataclasses in `connectors/base.py` instead of branching per source inside a job.
+
+### Google source layer (`google/*` + `auth/google_auth.py`)
+
+Thin per-API wrappers under `google/` that `connectors/google.py` composes; they take a `GoogleConfig` + the user's email and return raw API dicts.
+
+- **Impersonation is per call.** `build_service()` mints fresh domain-wide-delegation credentials (`.with_subject(user_email)`) and a new discovery-cached-off client for *every* wrapper call — there is no long-lived service object to thread around.
+- **The read-only invariant is enforced in code**, not just by config: `impersonated_credentials()` raises `ValueError` on any scope that doesn't end in `.readonly`. That guard is the enforcement point for "sources never write back" — don't route around it.
+- **No retry layer.** Unlike Graph, Google calls have no tenacity wrapper: an `HttpError`/timeout propagates straight into the job's per-item `except`, which marks the item `failed` and holds the cursor.
+- **Expired-cursor fallbacks** live here: Gmail `historyId` 404 → warn + full sync (`gmail.iter_messages`), People `syncToken` 410 → recursive re-baseline (`people.iter_contacts`, which also must send `requestSyncToken=True` or the API never returns a token at all). Google Calendar's syncToken 410 still raises — see `TODO.md`.
+- **Native Google Docs** are exported, not downloaded: `drive.EXPORT_MIME_MAP` maps Docs/Sheets/Slides/Drawings to Office/SVG formats plus the extension the connector appends; a `None` entry (Forms, Apps Script) becomes `action="skip"` with a note, and any other `application/vnd.google-apps.*` type is skipped the same way.
+- **Calendars are pulled with `singleEvents=False`** (series stay intact) and `showDeleted=True`, which is what makes the recurrence-exception reconciliation below possible. `people.iter_contacts` / `calendar.iter_events` / `drive.iter_drive_changes` buffer a whole result set in memory and return `(items, new_cursor)` rather than streaming.
+
+### Mail import (`microsoft/mail.py`)
+
+Graph's MIME create is documented as "Create a **draft**": every MIME import lands with `isDraft: true` and `receivedDateTime` stamped at import time, and neither is correctable after creation. `workloads.mail.import_mode` selects the strategy; `import_message()` dispatches.
+
+- **`json` (default)** — `import_json_message()` parses the MIME and creates the message via the JSON API with the MAPI extended properties that are only writable at create time: `PidTagMessageFlags` (0x0E07 — a clear unsent bit is what makes it a non-draft; also encodes read state), `PidTagClientSubmitTime`/`PidTagMessageDeliveryTime` (0x0039/0x0E06 — original sent/received dates in UTC; received parsed from the topmost `Received` header, falling back to `Date`), and `PidTagTransportMessageHeaders` (0x007D — original header block, capped at 32 KB). `isRead` and categories ride on the create — no follow-up PATCH. Attachments go inline while the total stays under ~2 MB (Graph caps requests at 4 MB); larger sets are added post-create via the attachment APIs (single POST ≤3 MB, chunked upload session above — documented to work on existing messages). If the tenant 400s the fidelity extras (from/sender/replyTo/headers), one retry drops them but always keeps flags + dates.
+- **`mime`** — byte-perfect content via the original recovery ladder: normalize CRLF (`_normalize_crlf` — Graph rejects bare-LF with an opaque 400 `UnableToDeserializePostBody`) → size routing (≤3 MB single POST; larger strips `Content-Disposition: attachment` parts and re-adds them, inline/cid parts stay) → deserialize-400 diagnostics (header line-length stats; `MIGRATOR_DUMP_REJECTED_MIME=<dir>` dumps the first 5 rejects as `.eml`) + retry with `_TRACE_HEADERS` stripped → `_import_via_json` last resort (same JSON machinery as json mode). Accepts the draft/import-date limitation; flags are PATCHed after import, best-effort.
+
+**Job ordering invariant (`mail_job`):** the item is marked `done` immediately after the primary-folder import succeeds; extra folder copies (`multi_label_policy: duplicate`) and mime-mode flag patches are best-effort afterwards (warn, never fail the item). Flipping the status back after a successful import would re-import the message as a duplicate on the next run — don't.
+
+**Folder placement:** `mail_job` routes *top-level* system folders through `resolve_folder_segment()` to Graph **well-known folder ids** (`inbox`, `sentitems`, …) so mail lands in the real Inbox instead of a duplicate custom folder with the same display name. Everything else goes through `ensure_mail_folder()`, which paginates the folder listing with `$top=100` (Graph returns only 10 folders per page by default — a naive single GET misses folders and then 409s on create) and resolves a 409 `ErrorFolderExists` by re-lookup. `ensure_contact_folder` and the drive `ensure_folder` follow the same paginate + 409-recover pattern; `microsoft/calendar.py:ensure_calendar` is the one outlier (single un-paginated GET, no 409 recovery — backlog item).
+
+**Message state:** Gmail STARRED becomes the Outlook follow-up flag (`SourceMessage.is_flagged` → `flag: {flagStatus: flagged}` on the json create, PATCHed in mime mode) and IMPORTANT becomes an `"Important"` category — set by the connector, not the label transform. Spam/Trash are enumerated when `workloads.mail.include_spam_trash` is true (default) and route to JunkEmail/DeletedItems.
+
+### Calendar recurrence exceptions (`calendar_job._apply_exception`)
+
+With `singleEvents=False`, Google returns modified/cancelled single occurrences as separate events carrying `recurringEventId` + `originalStartTime`. The connector stamps these on `SourceEvent` (`master_source_id` / `original_start`); `calendar_job` defers them to the end of the pass (so masters exist), looks up the master's `dest_id` in ItemMap, locates the destination occurrence via `microsoft/calendar.py:find_instance()` (`/events/{master}/instances` windowed around the original start, matched on `originalStart`/`start` normalized to UTC), then PATCHes it (modified) or DELETEs it (cancelled). A cancelled occurrence that's already absent counts as done. Failures hold back the calendar's cursor like any other item. The M365 source doesn't enumerate exceptions at all yet — see TODO.md.
+
+**Contact photos** ride the same lazy pattern as file content: connectors stamp `SourceContact.photo_ref` (Google: People photo URL, skipping default avatars; M365: contact id → `photo/$value`, 404 quieted) and `contacts_job` uploads via `set_contact_photo()` after create, best-effort — photo failures never fail the contact.
+
+### OneDrive/SharePoint files writer (`microsoft/files.py`)
+
+- **Lazy provisioning:** a destination user's OneDrive is provisioned lazily — the first `GET /users/{id}/drive` 404s ("mysite not found") but *queues* provisioning. `files_job` calls `ensure_onedrive()` before any writes; it polls ~2.5 min and raises an actionable error (pre-provision via `Request-SPOPersonalSite` or a user sign-in). Failure skips just that user.
+- **Simple upload is PUT-only** (`upload_small_file` → `put_raw`); POST to `:/content` is a 405 per the docs.
+- **`ensure_folder`** paginates `/children` and matches client-side, case-insensitively — Graph's `/children` endpoint does not support `$filter` at all — and resolves a 409 `nameAlreadyExists` by re-listing (same pattern as `ensure_mail_folder`).
 
 ### Config Scaffolding (`init-config`)
 
@@ -83,7 +127,9 @@ The tool migrates from a pluggable **source** to a Microsoft 365 **destination**
    - If user_key provided, also acquires from per-user limiter.
    - Throttles by sleeping if capacity exhausted.
 
-**Key invariant:** Rate limiters are checked BEFORE every API call, including retries. Tenacity retry decorator wraps after rate limiting, so a retry doesn't bypass the limiter.
+**Key invariant:** Rate limiters are checked before every attempt — `_apply_rate_limits` runs *inside* the tenacity-retried closure, so retries re-acquire tokens rather than bypassing the limiter.
+
+**The Google side is not symmetric.** There is no Google counterpart to `GraphClient`: each function in `google/*.py` calls `registry.acquire("google_global")` inline before its request, wrapped in `except KeyError: pass` so unit tests work without a registered bucket. Keep that inline acquire when adding a `google/*` call — it is the only thing throttling the Google API, and (per the Google source layer above) there is no retry underneath it either.
 
 ### Idempotency & State Store
 
@@ -105,6 +151,8 @@ with session_scope() as s:
 
 If a job is interrupted and re-run, it resumes from the first `pending` item. This is true re-entrancy: no duplicate writes.
 
+**SQLite under threads:** `init_db` sets `check_same_thread=False`, a 30 s busy timeout, and WAL journal mode — the per-workload thread pools commit concurrently and would otherwise hit cross-thread errors and "database is locked".
+
 **Other tables:**
 - FolderMap: source folder path → destination folder ID (used by files, mail, calendar)
 - SyncCursor: Stores pagination tokens per (user, workload) for delta syncs
@@ -124,7 +172,7 @@ If a job is interrupted and re-run, it resumes from the first `pending` item. Th
 
 ### Sources never write back; destination is always Graph
 
-The `google_workspace` source uses `.readonly` OAuth scopes (gmail/drive/contacts/calendar); the `imap` source connects read-only; the `microsoft365` source only reads from the source tenant. Connectors never mutate the source — all writes go to the Microsoft Graph destination (Outlook, OneDrive, SharePoint). Treat this as a safety invariant when adding source methods.
+The `google_workspace` source uses `.readonly` OAuth scopes (gmail/drive/contacts/calendar), enforced at runtime by `auth/google_auth.py` (see Google source layer); the `imap` source connects read-only; the `microsoft365` source only reads from the source tenant. Connectors never mutate the source — all writes go to the Microsoft Graph destination (Outlook, OneDrive, SharePoint). Treat this as a safety invariant when adding source methods.
 
 ### Job Execution Model
 
@@ -135,9 +183,9 @@ The `google_workspace` source uses `.readonly` OAuth scopes (gmail/drive/contact
 **First line of every job:** `ctx.require_capability("<workload>")` — raises if the configured source doesn't support it.
 
 **Mode behavior:**
-- `"full"`: Process all items. Connectors capture a sync cursor during iteration; the job persists it via `ctx.source.get_last_cursor(key)` afterward.
-- `"delta"`: Read the stored cursor, pass it as `since` to the connector, process only changed items.
-- `"whatif"`: Inventory only. Jobs branch to `_whatif_<workload>`, iterate `ctx.source.inventory_*`, and write rows to `_pkg._current_manifest` (a `ManifestWriter`). No Graph calls, no `ItemMap`/`SyncCursor` writes. `ctx.dest_gc` is `None`.
+- `"full"`: Process all items. Connectors capture a sync cursor during iteration; the job persists it via `ctx.source.get_last_cursor(key)` afterward — **only when the run had zero item failures**. Advancing the cursor past a failed item would drop it from every future delta, so a run with failures keeps the old cursor and the next run retries them (idempotency makes the re-scan safe).
+- `"delta"`: Read the stored cursor, pass it as `since` to the connector, process only changed items. **A missing cursor refuses the run** (warn + return) instead of silently re-scanning the whole source; the failure-gating above applies here too.
+- `"whatif"`: Inventory only. Jobs branch to `_whatif_<workload>`, iterate `ctx.source.inventory_*`, and write rows to `_pkg._current_manifest` (a `ManifestWriter`). No Graph calls, no `ItemMap`/`SyncCursor` writes, and `ctx.dest_gc` is `None` — but the orchestrator still records a `JobRun` row per user, so whatif is not *quite* read-only on state (see `TODO.md`).
 
 Example (contacts_job.py):
 ```python
@@ -152,7 +200,13 @@ if (cursor := ctx.source.get_last_cursor("contacts")):
 
 ### Error Handling & Retries
 
-**Graph API retries:** GraphClient wraps all requests with tenacity retry (up to 7 attempts, exponential backoff 2–60s). Retryable: 429 (throttled), 500–504 (server errors), timeouts, network errors.
+**Graph API retries:** GraphClient wraps all requests with tenacity retry (up to 7 attempts, exponential backoff 2–60s). Retryable: 429 (throttled), 500–504 (server errors), timeouts, network errors, and `httpx.RemoteProtocolError`. Between retries a `before_sleep` hook calls `_reset_transport()` — dropping the pooled connections and redialing fresh — because a half-closed keep-alive socket is the cause of the "works for a while, then every request fails" cascade (surfacing as `RemoteProtocolError` or bogus deserialize-400s). A content-based 400 `UnableToDeserializePostBody` is deliberately **not** retryable at the client layer; the mail layer owns that recovery (see the mail import recovery ladder).
+
+**Error visibility:** on any 4xx/5xx, GraphClient logs the response body (Graph's `error.code`/`message` — `raise_for_status()` alone would drop it) plus a truncated echo of the outgoing JSON request body; raw `content=` payloads (MIME, file bytes) are reported by size only. Preserve this when touching `_request` — it's the primary tool for diagnosing body-shape rejections.
+
+**Upload sessions:** requests to non-Graph hosts (the pre-authenticated `uploadUrl`s returned by createUploadSession) are sent **without** the Authorization header — the OneDrive docs warn that including it can 401. Only Graph-host requests get the bearer token + JSON default content type.
+
+**CLI exit codes:** every migration command exits 1 when the run left anything behind — a failed user-level run or any ItemMap row that flipped to `failed` during the run (`cli._exit_if_failures`) — so scripted cutovers can't mistake a bad run for success.
 
 **Migration job errors:** If a single item fails (e.g., create_contact() throws), the job catches it, logs, and upsets ItemMap with status="failed". The job continues to the next item. Workload-level errors bubble up and mark JobRun.status="failed"; the orchestrator logs but does not re-run.
 
@@ -166,7 +220,7 @@ Per-job config arrives via `ctx.config` (and `ctx.source`/`ctx.dest_gc`) — see
 
 Two SharePoint flows exist; both bypass the per-user `run_workload` path and instead use a dedicated `Orchestrator` method that builds one source + one destination client and a sentinel `JobContext`. Both upload through the shared `microsoft/files.py` writers with `drive_root=f"drives/{dest_drive_id}"` and namespace state by source id (`shared_drive:<id>` / `sharepoint_site:<id>`).
 
-- **`migrator shared-drives`** (google_workspace source) — `Orchestrator.run_shared_drives()` impersonates the Workspace `admin_email` to enumerate/download Drive content, and for each `shared_drives` mapping calls `microsoft/sharepoint.py:ensure_site_for_drive()` — provisions a connected M365 group/team site (`POST /groups`, polls `/groups/{id}/sites/root`), resolves its default document library, and records it in `FolderMap` (`workload="sharepoint_site"`) for idempotent reuse.
+- **`migrator shared-drives`** (google_workspace source) — `Orchestrator.run_shared_drives()` impersonates the Workspace `admin_email` to enumerate/download Drive content, and for each `shared_drives` mapping calls `microsoft/sharepoint.py:ensure_site_for_drive()` — provisions a connected M365 group/team site (`POST /groups`, polls `/groups/{id}/sites/root`), resolves its default document library, and records it in `FolderMap` (`workload="sharepoint_site"`) for idempotent reuse. Groups are created **Private** with a charset-sanitized `mailNickname`, and bound to `destination.sharepoint_site_owner` when set — Graph documents that app-only groups created *without* an owner may never get their site provisioned, so set it.
 - **`migrator sharepoint`** (microsoft365 source) — `Orchestrator.run_sharepoint_sites()` migrates SharePoint libraries tenant-to-tenant. `M365Source.resolve_site_drive()` resolves the source site's library drive; the destination is an existing `dest_site` (`resolve_existing_site_drive()`) or an auto-provisioned `target_site_alias` (reusing `ensure_site_for_drive()`).
 
 `M365Source` file reads are **drive-generic**: `_iter_drive(drive_root, …)` walks any drive's delta feed and stamps `SourceFile.drive_root` so `fetch_file()` reads content from the right drive (OneDrive `users/<id>/drive` or SharePoint `drives/<id>`). Both flows require `Group.ReadWrite.All` + `Sites.*` on the destination app (only auto-provisioning needs `Group.ReadWrite.All`).
@@ -202,24 +256,16 @@ Parallel to `_current_config`, the package holds `_pkg._current_manifest: Manife
 
 `MSTokenProvider` (auth/ms_auth.py) is an MSAL confidential-client provider with a thread lock and serialized disk token cache. It accepts **either** `certificate_path` + `certificate_thumbprint` (preferred) **or** `client_secret`; supplying neither raises at construction. Scope is fixed to `https://graph.microsoft.com/.default` (app-only). Each per-thread GraphClient holds its own provider — see "Threading & Job Dispatch".
 
+## Testing Patterns
+
+There is no `conftest.py` and no shared fixtures package — every test file builds what it needs from these idioms. Match them when adding coverage:
+
+- **Config:** `Config.model_validate({...})` from an inline dict (see `tests/test_mail_job.py:_config`), never a YAML file on disk.
+- **Fake destination client:** a plain class exposing just the methods under exercise (`get`/`post`/`patch`/`paginate`) that records calls and returns canned `{"id": ...}` dicts, passed where a `GraphClient` is expected with `# type: ignore[arg-type]`. Failure injection is by call ordinal (`fail_posts={2}`) so a test can fail the *second* import and assert the first stayed `done`.
+- **Real `GraphClient`, fake transport:** construct with a stub token provider, then swap `gc._client` for `httpx.Client(transport=httpx.MockTransport(handler))` to assert on headers, URLs, and pagination; `GraphClient.__new__(GraphClient)` skips `__init__` when only one method is under test. Monkeypatch `tenacity.nap.time.sleep` to skip retry backoff.
+- **State:** `init_db(tmp_path / "state.db")`, then assert through `session_scope()` and the `state/db.py` helpers. `init_db` assigns **module-level** `_engine`/`_SessionFactory`, so it is a process-wide switch: re-calling it repoints every later `session_scope()`, and deliberately *not* calling it again is how a test simulates a re-run against existing state (`fresh_db=False` in `test_mail_job.py`).
+- **Job loops:** subclass `BaseSource`, set `capabilities`, implement only the `iter_*` method under test (recording the `since` it was handed), and hand-build a `JobContext`. That is the entire harness for an end-to-end workload run — no orchestrator, no threads.
+
 ## Known Gaps / TODO
 
-Open work items identified during review (roughly ordered by data-fidelity impact). None of these are wired up yet — treat as the backlog.
-
-### Correctness / data fidelity
-- **Timestamp-based delta for mail/contacts/calendar is lossy.** Only files use real Graph delta tokens; mail/contacts/calendar set the cursor to "now" and filter on `receivedDateTime`/`lastModifiedDateTime ge since` (`connectors/m365.py`). This misses folder moves and read/flag/category changes after cutover, and is clock-skew sensitive. Move these workloads to proper Graph delta queries (`/messages/delta`, `/contacts/delta`, `/events/delta`).
-- ~~**Calendar attendees/organizer keep source-tenant addresses.**~~ *Done.* `calendar_job.run_calendar` now applies `transform/identities.py:IdentityMap.remap_event()` (config-driven `source_id`→`dest_id`) to each event body before `create_event`, rewriting attendee + organizer addresses to destination UPNs. Note the M365 source still doesn't carry `organizer` in `_EVENT_FIELDS` (Graph sets organizer to the calendar owner on create), so the organizer remap is defensive for now.
-- **Recurring-event exceptions are lost.** Only the series master + plain instances are pulled; modified single occurrences of a recurring series aren't reconciled.
-- **No contact photos or calendar attachments.** `_CONTACT_FIELDS` omits the photo; `create_event` posts only the body, not event attachments.
-
-### Coverage / functionality
-- **No permissions/sharing migration.** `SourceFile` carries no ACL data — Drive/SharePoint sharing, link permissions, and ownership are dropped. Commonly required; needs a permissions model on `SourceFile` plus a destination writer.
-- **`validate` report can't detect data loss.** `reporting.py` only counts local `ItemMap` statuses — it never reconciles source vs. destination item counts/checksums, so silently-skipped or never-enumerated items won't surface. Add source↔dest reconciliation. *(Partly addressed: the report no longer hardcodes `("contacts","calendar","files","mail")` — it now discovers every `(user, workload)` pair from `ItemMap` so `shared_drive:*` / `sharepoint_site:*` results appear, unioned with the standard per-user workloads so a configured user with zero rows still surfaces.)*
-- **Thin pre-flight checks.** `smoke-test` probes one pilot user only; there's no bulk validation that all `dest_id` mailboxes exist / are licensed / are provisioned before a `run-all`.
-
-### Reliability / scale
-- **Files are fully buffered in memory.** `fetch_file` returns full `bytes` and the upload writers take full `content: bytes` — a multi-GB file is loaded entirely into RAM on both download and upload. Stream download→upload to cap memory and lift the practical file-size ceiling.
-- **Tenant-level SharePoint/Shared-Drive flows are single-threaded.** `run_shared_drives` / `run_sharepoint_sites` loop drives and files sequentially (no `ThreadPoolExecutor`), unlike the per-user workloads. Parallelize for large libraries.
-
-### Testing
-- **Job/writer paths lack mocked-Graph coverage.** Tests are mostly pure-logic plus the new mail-writer tests; the per-user job loops (contacts/calendar/files/mail) and the Graph writers have no fake-client integration tests. Add a recording/fake GraphClient harness and cover the job loops end-to-end.
+The backlog lives in `TODO.md` — open items ordered by data-fidelity impact, each stating the change it adds, plus a "Recently completed" log. Treat `TODO.md` as the single source of truth (this section previously duplicated it and the two drifted). When you complete or discover a backlog item, update `TODO.md` in the same change.

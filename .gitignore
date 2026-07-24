@@ -20,6 +20,14 @@ migration_state.db
 migrator.log
 *.log
 
+# --- Generated inventory & reports (contain real user data: addresses,
+#     mail subjects, file paths) ---
+whatif_manifest.csv
+*_manifest.csv
+migration_report.html
+report.html
+*_report.html
+
 # --- Python ---
 __pycache__/
 *.py[cod]
