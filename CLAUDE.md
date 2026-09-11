@@ -32,10 +32,10 @@ mypy src/
 Strict mode enabled (strict = true). Python 3.11+.
 
 ### Baseline state of the checks
-`pytest` is green (147 tests, ~5 s, no network). `ruff check src/` and `mypy src/` are **not** clean: there is a pre-existing baseline of 10 ruff E501s and 21 mypy errors (untyped `googleapiclient` returns in `google/*`, `Returning Any` in thin Graph writers), tracked in `TODO.md`. Treat those counts as the floor — fix what you touch, don't add new ones, and don't read the existing output as breakage you caused. Neither tool is configured over `tests/` (`src = ["src"]`, `mypy src/`).
+`pytest` is green (147 tests, ~5–8 s, no network). `ruff check src/` and `mypy src/` are **not** clean: there is a pre-existing baseline of 10 ruff E501s and 21 mypy errors (untyped `googleapiclient` returns in `google/*`, `Returning Any` in thin Graph writers), tracked in `TODO.md`. Treat those counts as the floor — fix what you touch, don't add new ones, and don't read the existing output as breakage you caused. Neither tool is configured over `tests/` (`src = ["src"]`, `mypy src/`).
 
 ### Local artifacts (never commit)
-The CLI writes into the current working directory: `migration_state.db` (+ WAL sidecars), `migrator.log`, `.ms_token_cache.json`, `whatif_manifest.csv`, `migration_report.html`. `.gitignore` covers the credentials / state / log / token-cache set, but the **whatif manifest and validation report are not ignored and contain real mailbox subjects, file names, and user addresses** — don't stage them. `cli._setup_logging` pins the file handler to `encoding="utf-8"` because this is developed/run on Windows, where the default cp1252 encoder crashes on the `→` in log messages.
+The CLI writes into the current working directory: `migration_state.db` (+ WAL sidecars), `migrator.log`, `.ms_token_cache.json`, `whatif_manifest.csv`, `migration_report.html`. All of these are gitignored (credentials, `*.db`, `*.log`, token caches, `*_manifest.csv`, `*_report.html`). The manifest and report contain real mailbox subjects, file names, and user addresses, so if you add a new output path keep it under one of those patterns. `cli._setup_logging` pins the file handler to `encoding="utf-8"` because this is developed/run on Windows, where the default cp1252 encoder crashes on the `→` in log messages.
 
 ### Run the CLI Tool
 ```bash
@@ -80,6 +80,14 @@ Thin per-API wrappers under `google/` that `connectors/google.py` composes; they
 - **Native Google Docs** are exported, not downloaded: `drive.EXPORT_MIME_MAP` maps Docs/Sheets/Slides/Drawings to Office/SVG formats plus the extension the connector appends; a `None` entry (Forms, Apps Script) becomes `action="skip"` with a note, and any other `application/vnd.google-apps.*` type is skipped the same way.
 - **Calendars are pulled with `singleEvents=False`** (series stay intact) and `showDeleted=True`, which is what makes the recurrence-exception reconciliation below possible. `people.iter_contacts` / `calendar.iter_events` / `drive.iter_drive_changes` buffer a whole result set in memory and return `(items, new_cursor)` rather than streaming.
 
+### IMAP source (`connectors/imap.py`)
+
+Mail-only (`capabilities = {"mail"}`), raw `imaplib`, one connection per connector instance (i.e. per thread), logging in as `imap_user or source_id` with `UserMapping.resolve_imap_password()` (env var preferred over inline password). **Folder placement** — a `\Sent`/`\Drafts`/`\Trash`/`\Junk` special-use attribute wins, then a leaf-name heuristic (`sent`, `spam`, `deleted items`, …), otherwise the hierarchy is kept with the server delimiter rewritten to `\`. The tokens it emits (`SentItems`, `JunkEmail`, …) are the same ones the Gmail path produces, so `mail_job` routes both through `resolve_folder_segment()` identically. `\Noselect` folders and `source.exclude_folders` are skipped. **Read-only** is enforced by `select(..., readonly=True)` on every folder, so FETCH never sets `\Seen`. **Cursor** is a JSON map `folder → {uidvalidity, uidnext}`: a delta pass searches `UID <prev uidnext>:*` per folder, and a changed UIDVALIDITY re-scans that folder from UID 1 — ItemMap keys are `folder:uidvalidity:uid`, so that re-scan does not dedupe against the earlier import. Known gaps (`TODO.md`): folder names are decoded as UTF-8 rather than RFC 3501 modified UTF-7, and literal-form LIST responses are dropped.
+
+### Microsoft 365 source (`connectors/m365.py`)
+
+Reads the *source* tenant through a second per-thread `GraphClient` (see Threading) and never calls `post`/`patch`/`delete` on it. Mail folders are mapped by walking `mailFolders` → `childFolders` and translating top-level `wellKnownName`s to the canonical tokens the other sources emit (`_WELLKNOWN_TO_TOKEN`); messages are fetched as raw MIME via `/messages/{id}/$value`, so the destination writer path is identical to Gmail/IMAP. **Delta is asymmetric:** files (OneDrive and SharePoint, via `_iter_drive`) use real Graph delta links, but mail/contacts/calendar stamp the cursor to "now" and `$filter` on `receivedDateTime`/`lastModifiedDateTime ge since` — lossy for folder moves and flag changes, and it never enumerates recurrence exceptions or hidden folders (all backlog items).
+
 ### Mail import (`microsoft/mail.py`)
 
 Graph's MIME create is documented as "Create a **draft**": every MIME import lands with `isDraft: true` and `receivedDateTime` stamped at import time, and neither is correctable after creation. `workloads.mail.import_mode` selects the strategy; `import_message()` dispatches.
@@ -111,21 +119,9 @@ With `singleEvents=False`, Google returns modified/cancelled single occurrences 
 
 ### Rate Limiting (Three-Layer System)
 
-1. **Global Registry** (singleton at `migrator.ratelimit.registry`):
-   - Orchestrator registers two named token buckets at startup: `"google_global"` and `"graph_global"` from config.rate_limits.
-   - TokenBucket implements token-bucket algorithm with thread-safe locking.
-   - Jobs never interact with registry directly.
-
-2. **Per-User Limiter** (PerUserRateLimiter instance):
-   - Passed to every GraphClient instance created by Orchestrator.
-   - Maintains a dict of TokenBuckets keyed by user (e.g., mailbox ID).
-   - Used for Graph API per-mailbox throttling (graph_requests_per_mailbox_per_minute).
-
-3. **GraphClient Integration**:
-   - Every GraphClient.get/post/patch/delete/paginate call invokes `_apply_rate_limits(user_key)` before the request.
-   - Acquires from global registry first (may pass silently if not registered).
-   - If user_key provided, also acquires from per-user limiter.
-   - Throttles by sleeping if capacity exhausted.
+1. **Global registry** — singleton `migrator.ratelimit.registry`. `Orchestrator._setup_rate_limiters` registers two thread-safe `TokenBucket`s, `"google_global"` and `"graph_global"`, from `config.rate_limits`. Jobs never touch it directly.
+2. **Per-user limiter** — one `PerUserRateLimiter` (a dict of buckets keyed by mailbox/drive id, rate `graph_requests_per_mailbox_per_minute`) handed to every GraphClient the Orchestrator builds.
+3. **GraphClient** — every `get/get_bytes/post/patch/delete/put_raw/paginate` goes through `_request`, which calls `_apply_rate_limits(user_key)` first: acquire from the global bucket (silently skipped if unregistered — which is how the unit tests run), then from the per-user bucket when a `user_key` is passed. Sleeps when a bucket is empty.
 
 **Key invariant:** Rate limiters are checked before every attempt — `_apply_rate_limits` runs *inside* the tenacity-retried closure, so retries re-acquire tokens rather than bypassing the limiter.
 
@@ -133,23 +129,7 @@ With `singleEvents=False`, Google returns modified/cancelled single occurrences 
 
 ### Idempotency & State Store
 
-**Invariant:** Before processing any item (contact, event, email, file), job checks `is_done(session, user_email, workload, source_id)` against ItemMap table.
-
-**ItemMap table:**
-- Unique constraint: (user_email, workload, source_id)
-- Fields: status (pending/done/failed/skipped), dest_id, source_hash, attempts, last_error, updated_at
-- Accessed via helpers: `is_done()`, `upsert_item()` (using SQLite INSERT OR REPLACE with conflict handling)
-
-**How it works:**
-```python
-with session_scope() as s:
-    if is_done(s, user.google_email, "contacts", source_id):
-        continue  # Skip already-done items
-    # ... do migration ...
-    upsert_item(s, user.google_email, "contacts", source_id, dest_id=dest_id, status="done")
-```
-
-If a job is interrupted and re-run, it resumes from the first `pending` item. This is true re-entrancy: no duplicate writes.
+**Invariant:** before processing any item (contact, event, email, file) the job checks `is_done(session, user.source_id, workload, item_source_id)` against `ItemMap`, and after a successful write calls `upsert_item(..., dest_id=..., status="done")`. `ItemMap` is unique on `(user_email, workload, source_id)` and carries `status` (pending/done/failed/skipped), `dest_id`, `source_hash`, `attempts`, `last_error`. The `user_email` column in every state table holds the mapping's **`source_id`** (the name predates the multi-source refactor). An interrupted run resumes at the first non-done item with no duplicate writes — see the contacts_job example under Job Execution Model.
 
 **SQLite under threads:** `init_db` sets `check_same_thread=False`, a 30 s busy timeout, and WAL journal mode — the per-workload thread pools commit concurrently and would otherwise hit cross-thread errors and "database is locked".
 
@@ -172,15 +152,11 @@ If a job is interrupted and re-run, it resumes from the first `pending` item. Th
 
 ### Sources never write back; destination is always Graph
 
-The `google_workspace` source uses `.readonly` OAuth scopes (gmail/drive/contacts/calendar), enforced at runtime by `auth/google_auth.py` (see Google source layer); the `imap` source connects read-only; the `microsoft365` source only reads from the source tenant. Connectors never mutate the source — all writes go to the Microsoft Graph destination (Outlook, OneDrive, SharePoint). Treat this as a safety invariant when adding source methods.
+Safety invariant: connectors only read. The enforcement point per source — `google_workspace`: `impersonated_credentials()` rejects any non-`.readonly` scope; `imap`: every folder is opened `readonly=True`; `microsoft365`: `M365Source` only ever calls `get`/`get_bytes`/`paginate` on the source client. All writes go to the destination Graph tenant (Outlook, OneDrive, SharePoint). Keep it that way when adding source methods.
 
 ### Job Execution Model
 
-**Signature:** `fn(ctx: JobContext) → None`
-
-`JobContext` (`context.py`) carries `user` (a `UserMapping`, `source_id`→`dest_id`), `source` (the `BaseSource` connector for this thread), `dest_gc` (destination GraphClient, or `None` in whatif), `mode`, and `config`. Jobs are source-agnostic: they iterate `ctx.source.iter_*` items and write via `microsoft/*` with `ctx.dest_gc`.
-
-**First line of every job:** `ctx.require_capability("<workload>")` — raises if the configured source doesn't support it.
+**Signature:** `fn(ctx: JobContext) → None` (`JobContext` is described under the Source/Destination model). Jobs are source-agnostic: they iterate `ctx.source.iter_*` items and write via `microsoft/*` with `ctx.dest_gc`. **First line of every job:** `ctx.require_capability("<workload>")`.
 
 **Mode behavior:**
 - `"full"`: Process all items. Connectors capture a sync cursor during iteration; the job persists it via `ctx.source.get_last_cursor(key)` afterward — **only when the run had zero item failures**. Advancing the cursor past a failed item would drop it from every future delta, so a run with failures keeps the old cursor and the next run retries them (idempotency makes the re-scan safe).
@@ -208,13 +184,11 @@ if (cursor := ctx.source.get_last_cursor("contacts")):
 
 **CLI exit codes:** every migration command exits 1 when the run left anything behind — a failed user-level run or any ItemMap row that flipped to `failed` during the run (`cli._exit_if_failures`) — so scripted cutovers can't mistake a bad run for success.
 
-**Migration job errors:** If a single item fails (e.g., create_contact() throws), the job catches it, logs, and upsets ItemMap with status="failed". The job continues to the next item. Workload-level errors bubble up and mark JobRun.status="failed"; the orchestrator logs but does not re-run.
+**Migration job errors:** If a single item fails (e.g., create_contact() throws), the job catches it, logs, and upserts ItemMap with status="failed". The job continues to the next item. Workload-level errors bubble up and mark JobRun.status="failed"; the orchestrator logs but does not re-run.
 
-**Idempotency recovery:** If a job crashes mid-run, re-running the same command resumes from the first non-done item (via is_done() check). Completed items will be skipped.
+### Package-level globals (`src/migrator/__init__.py`)
 
-### Config Propagation to Jobs
-
-Per-job config arrives via `ctx.config` (and `ctx.source`/`ctx.dest_gc`) — see Job Execution Model. The package-level `_pkg._current_config` / `_pkg._current_manifest` globals remain: `_current_config` is set by the Orchestrator in `__init__()`, and whatif jobs read `_current_manifest` (set by the `whatif` CLI command) to record planned items.
+Two survive the JobContext refactor: `_current_config` (set by `Orchestrator.__init__`) and `_current_manifest: ManifestWriter | None` (set by the `whatif` CLI command around the run, `None` otherwise). Whatif-mode jobs write inventory rows to the manifest instead of calling Graph. Nothing else should read these — per-job data comes from `ctx`.
 
 ### SharePoint migrations (tenant-level, not per-user)
 
@@ -231,13 +205,7 @@ Two SharePoint flows exist; both bypass the per-user `run_workload` path and ins
 
 ### Workload Structure
 
-Each workload (contacts, calendar, files, mail) is isolated:
-- Separate job function (contacts_job.run_contacts, etc.)
-- Separate state tables (ItemMap/FolderMap scoped by workload name)
-- Separate sync cursors (SyncCursor scoped by workload name)
-- Separate concurrency and feature configs (e.g., MailWorkloadConfig.multi_label_policy)
-
-This allows workloads to run independently, be enabled/disabled, and be re-run without affecting others.
+Each workload (contacts, calendar, files, mail) has its own job function, its own `ItemMap`/`FolderMap`/`SyncCursor` namespace (the `workload` column), and its own `enabled`/`concurrency` config, so any one can be disabled or re-run without touching the others. `run-all`/`delta`/`whatif` iterate `cli._WORKLOAD_ORDER` (contacts → calendar → files → mail).
 
 ### Transform Layer
 
@@ -247,10 +215,6 @@ This allows workloads to run independently, be enabled/disabled, and be re-run w
 - **recurrence.py** — `rrule_to_graph_recurrence()` converts an iCal RRULE string + start datetime into a Graph `recurrence` object (pattern + range). Handles BYDAY→daysOfWeek, weekly/monthly/yearly indices, and the weekday derived from the event start.
 - **paths.py** — `sanitize_segment()` / `sanitize_path()` strip characters illegal in OneDrive/SharePoint names so Drive folder structures map cleanly.
 - **identities.py** — `IdentityMap` rewrites source identities to destination M365 UPNs using `config.users` (`source_id` → `dest_id`) as the source of truth — pure/deterministic, no Graph calls. `map_address()` returns the mapped address (or the original when unmapped, so external attendees pass through); `remap_event()` rewrites attendee + organizer addresses on a Graph event body in place. Applied by `calendar_job.run_calendar` before `create_event`, so migrated events reference live destination mailboxes rather than dead source ones.
-
-### Whatif Manifest Injection
-
-Parallel to `_current_config`, the package holds `_pkg._current_manifest: ManifestWriter | None` (`src/migrator/__init__.py`). The `whatif` CLI command sets it around the run; jobs in `whatif` mode write inventory rows to it instead of calling Graph. It is `None` outside whatif runs.
 
 ### Microsoft Auth Modes
 
