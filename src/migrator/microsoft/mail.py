@@ -54,6 +54,22 @@ _LARGE_ATTACHMENT_THRESHOLD = 3 * 1024 * 1024
 # Upload-session chunk: a multiple of 320 KiB and under the 4 MB per-PUT cap.
 _ATTACHMENT_CHUNK = 10 * 320 * 1024
 
+# ── JSON-create import (default mode) ─────────────────────────────────────────
+# Graph's MIME create is documented as "Create a *draft*": every MIME import
+# lands with isDraft=true and receivedDateTime stamped at import time, and
+# neither can be corrected after creation. The JSON create path can set the
+# MAPI properties that control both *at creation* — the standard Graph
+# migration recipe — so it is the default (workloads.mail.import_mode).
+_PROP_MESSAGE_FLAGS = "Integer 0x0E07"  # PidTagMessageFlags: 0x1=read; 0x8 (draft) left clear
+_PROP_CLIENT_SUBMIT_TIME = "SystemTime 0x0039"  # PidTagClientSubmitTime → sentDateTime
+_PROP_MESSAGE_DELIVERY_TIME = "SystemTime 0x0E06"  # PidTagMessageDeliveryTime → receivedDateTime
+_PROP_TRANSPORT_HEADERS = "String 0x007D"  # PidTagTransportMessageHeaders (original header block)
+_MAX_HEADER_PROP_LEN = 32 * 1024
+# Inline the parsed attachments in the create request only while the JSON body
+# stays well under Graph's 4 MB request cap; otherwise add them after create
+# via the attachment APIs (documented to work on existing messages).
+_MAX_INLINE_ATTACH_TOTAL = 2 * 1024 * 1024
+
 
 def resolve_folder_segment(part: str, is_top_level: bool) -> str | None:
     """Return the Graph well-known folder id for a top-level system-folder token,
@@ -111,6 +127,166 @@ def _find_folder_by_name(
     return None
 
 
+def import_message(
+    gc: GraphClient,
+    ms_user_id: str,
+    folder_id: str,
+    raw_mime: bytes,
+    *,
+    is_read: bool = True,
+    is_flagged: bool = False,
+    categories: list[str] | None = None,
+    mode: str = "json",
+) -> str:
+    """Import one message using the configured strategy.
+
+    ``"json"`` (default) parses the MIME and creates the message via the JSON
+    API with MAPI extended properties, so it arrives as a normal non-draft
+    message with the original sent/received dates, read/flag state, and
+    categories. ``"mime"`` posts the raw MIME (byte-perfect content, but Graph
+    creates it as a draft dated at import time; flags must be patched
+    separately)."""
+    if mode == "mime":
+        return import_mime_message(gc, ms_user_id, folder_id, raw_mime)
+    return import_json_message(
+        gc, ms_user_id, folder_id, raw_mime,
+        is_read=is_read, is_flagged=is_flagged, categories=categories,
+    )
+
+
+def import_json_message(
+    gc: GraphClient,
+    ms_user_id: str,
+    folder_id: str,
+    raw_mime: bytes,
+    *,
+    is_read: bool = True,
+    is_flagged: bool = False,
+    categories: list[str] | None = None,
+) -> str:
+    """Create the message via the JSON message API with migration fidelity.
+
+    Sets the MAPI extended properties that are only writable at creation:
+    PidTagMessageFlags (a clear unsent bit is what makes the item a non-draft),
+    PidTagClientSubmitTime / PidTagMessageDeliveryTime (original sent/received
+    dates), and PidTagTransportMessageHeaders (original header block). If the
+    tenant rejects the fidelity extras (400), retries once with a reduced body
+    that still keeps flags and dates."""
+    if not raw_mime:
+        raise ValueError("source returned empty MIME body; nothing to import")
+    msg = email.message_from_bytes(_normalize_crlf(raw_mime), policy=policy.default)
+    body, attachments = _graph_body_and_attachments(msg)
+    inline_total = sum(len(a.get("contentBytes", "")) for a in attachments)
+    inline_attachments = attachments if inline_total <= _MAX_INLINE_ATTACH_TOTAL else []
+
+    path = f"/users/{ms_user_id}/mailFolders/{folder_id}/messages"
+    graph_msg = _build_json_message(
+        msg, raw_mime, body, inline_attachments,
+        is_read=is_read, is_flagged=is_flagged, categories=categories, fidelity=True,
+    )
+    try:
+        result = gc.post(path, user_key=ms_user_id, json=graph_msg)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 400:
+            raise
+        log.warning(
+            "JSON create rejected fidelity fields (from/replyTo/headers); "
+            "retrying with reduced body (flags/dates kept)"
+        )
+        graph_msg = _build_json_message(
+            msg, raw_mime, body, inline_attachments,
+            is_read=is_read, is_flagged=is_flagged, categories=categories, fidelity=False,
+        )
+        result = gc.post(path, user_key=ms_user_id, json=graph_msg)
+
+    message_id = str(result["id"])
+    if attachments and not inline_attachments:
+        for att in attachments:
+            _add_attachment(
+                gc, ms_user_id, message_id,
+                str(att["name"]), str(att["contentType"]),
+                base64.b64decode(str(att["contentBytes"])),
+                is_inline=bool(att.get("isInline")),
+                content_id=str(att["contentId"]) if att.get("contentId") else None,
+            )
+    return message_id
+
+
+def _build_json_message(
+    msg: Any,
+    raw_mime: bytes,
+    body: dict[str, str],
+    attachments: list[dict[str, Any]],
+    *,
+    is_read: bool,
+    is_flagged: bool,
+    categories: list[str] | None,
+    fidelity: bool,
+) -> dict[str, Any]:
+    graph_msg: dict[str, Any] = {
+        "subject": str(msg["Subject"] or ""),
+        "body": body,
+        "toRecipients": _graph_recipients(msg, "To"),
+        "ccRecipients": _graph_recipients(msg, "Cc"),
+        "bccRecipients": _graph_recipients(msg, "Bcc"),
+        "isRead": is_read,
+        "singleValueExtendedProperties": _extended_properties(
+            msg, raw_mime, is_read=is_read, include_headers=fidelity
+        ),
+    }
+    if is_flagged:
+        graph_msg["flag"] = {"flagStatus": "flagged"}
+    if categories:
+        graph_msg["categories"] = categories
+    if attachments:
+        graph_msg["attachments"] = attachments
+    if not fidelity:
+        return graph_msg
+
+    if (frm := _graph_recipients(msg, "From")):
+        graph_msg["from"] = frm[0]
+    if (sender := _graph_recipients(msg, "Sender")):
+        graph_msg["sender"] = sender[0]
+    if (reply_to := _graph_recipients(msg, "Reply-To")):
+        graph_msg["replyTo"] = reply_to
+    if msg["Message-ID"]:
+        graph_msg["internetMessageId"] = str(msg["Message-ID"]).strip()
+    return graph_msg
+
+
+def _extended_properties(
+    msg: Any, raw_mime: bytes, *, is_read: bool, include_headers: bool
+) -> list[dict[str, str]]:
+    """MAPI properties that must be stamped at create time; read-only after."""
+    props = [{"id": _PROP_MESSAGE_FLAGS, "value": "1" if is_read else "0"}]
+    sent = _parse_internet_date(msg["Date"])
+    received = _received_date(msg) or sent
+    if sent:
+        props.append({"id": _PROP_CLIENT_SUBMIT_TIME, "value": sent})
+    if received:
+        props.append({"id": _PROP_MESSAGE_DELIVERY_TIME, "value": received})
+    if include_headers and (headers := _header_text(raw_mime)):
+        props.append({"id": _PROP_TRANSPORT_HEADERS, "value": headers})
+    return props
+
+
+def _received_date(msg: Any) -> str | None:
+    """Delivery time from the topmost parseable Received header (final hop);
+    the timestamp sits after the last ';' per RFC 5322."""
+    for header in msg.get_all("Received", []) or []:
+        _, _, date_part = str(header).rpartition(";")
+        if (iso := _parse_internet_date(date_part.strip())):
+            return iso
+    return None
+
+
+def _header_text(raw_mime: bytes) -> str | None:
+    head = raw_mime.split(b"\r\n\r\n", 1)[0]
+    if not head:
+        return None
+    return head.decode("latin-1", "replace")[:_MAX_HEADER_PROP_LEN]
+
+
 def import_mime_message(
     gc: GraphClient,
     ms_user_id: str,
@@ -157,13 +333,10 @@ def import_mime_message(
             if not _is_deserialize_400(exc):
                 raise
 
-    # Last resort: build the message via the JSON API. Graph sets `from` to the
-    # mailbox owner (original sender/timestamps not preserved), but the message
-    # content, recipients, and attachments are migrated rather than dropped.
-    log.warning(
-        "MIME import failed after cleanup; falling back to JSON message create "
-        "(sender/timestamp fidelity lost)"
-    )
+    # Last resort: build the message via the JSON API (same machinery as the
+    # default json import mode — sender/dates/flags carried via MAPI extended
+    # properties, body re-encoded from the parsed MIME).
+    log.warning("MIME import failed after cleanup; falling back to JSON message create")
     return _import_via_json(gc, ms_user_id, folder_id, raw_mime)
 
 
@@ -237,65 +410,20 @@ def _cleaned_mime(raw_mime: bytes) -> bytes | None:
 
 
 def _import_via_json(gc: GraphClient, ms_user_id: str, folder_id: str, raw_mime: bytes) -> str:
-    """Create the message via the JSON message API (MIME-import last resort).
+    """MIME-mode last resort: same JSON create as the default import mode.
 
-    Parses the MIME into a Graph message resource preserving as much fidelity as
-    Graph allows on create: subject, body (HTML preferred), recipients, sender,
-    reply-to, message id, and sent/received timestamps, plus attachments. If Graph
-    rejects the writable-on-create identity/timestamp fields (tenant policy
-    varies), retry with a minimal body so the message still migrates."""
-    msg = email.message_from_bytes(raw_mime, policy=policy.default)
-    path = f"/users/{ms_user_id}/mailFolders/{folder_id}/messages"
-
-    try:
-        result = gc.post(path, user_key=ms_user_id, json=_mime_to_graph_message(msg, fidelity=True))
-        return str(result["id"])
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code != 400:
-            raise
-        log.warning(
-            "JSON create rejected fidelity fields (from/sender/dates); "
-            "retrying with minimal message body"
-        )
-    result = gc.post(path, user_key=ms_user_id, json=_mime_to_graph_message(msg, fidelity=False))
-    return str(result["id"])
-
-
-def _mime_to_graph_message(msg: Any, *, fidelity: bool) -> dict[str, Any]:
-    """Build a Graph message resource from a parsed email message.
-
-    With ``fidelity=True`` includes the identity/timestamp fields that are
-    writable on create (from/sender/replyTo/internetMessageId/sent+received
-    DateTime); with ``fidelity=False`` only the always-accepted content fields."""
-    body, attachments = _graph_body_and_attachments(msg)
-    graph_msg: dict[str, Any] = {
-        "subject": str(msg["Subject"] or ""),
-        "body": body,
-        "toRecipients": _graph_recipients(msg, "To"),
-        "ccRecipients": _graph_recipients(msg, "Cc"),
-        "bccRecipients": _graph_recipients(msg, "Bcc"),
-    }
-    if attachments:
-        graph_msg["attachments"] = attachments
-    if not fidelity:
-        return graph_msg
-
-    if (frm := _graph_recipients(msg, "From")):
-        graph_msg["from"] = frm[0]
-    if (sender := _graph_recipients(msg, "Sender")):
-        graph_msg["sender"] = sender[0]
-    if (reply_to := _graph_recipients(msg, "Reply-To")):
-        graph_msg["replyTo"] = reply_to
-    if msg["Message-ID"]:
-        graph_msg["internetMessageId"] = str(msg["Message-ID"]).strip()
-    if (sent := _parse_internet_date(msg["Date"])):
-        graph_msg["sentDateTime"] = sent
-        graph_msg["receivedDateTime"] = sent
-    return graph_msg
+    Read state defaults to read here; in mime mode mail_job patches the actual
+    flags after import."""
+    return import_json_message(
+        gc, ms_user_id, folder_id, raw_mime, is_read=True, categories=None
+    )
 
 
 def _parse_internet_date(value: Any) -> str | None:
-    """RFC 2822 date header -> ISO 8601 string (with offset) for Graph, or None."""
+    """RFC 2822 date header -> UTC ISO 8601 ("...Z") for Graph, or None.
+
+    MAPI SystemTime extended properties expect UTC, so the offset is folded in
+    rather than passed through."""
     if not value:
         return None
     from datetime import UTC
@@ -309,7 +437,7 @@ def _parse_internet_date(value: Any) -> str | None:
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
-    return dt.isoformat()
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _graph_recipients(msg: Any, header: str) -> list[dict[str, Any]]:
@@ -326,13 +454,50 @@ def _graph_recipients(msg: Any, header: str) -> list[dict[str, Any]]:
     return out
 
 
+def _rfc822_bytes(part: Any) -> tuple[str, bytes] | None:
+    """Serialize an attached email (a message/rfc822 part) to (.eml name, bytes).
+
+    To the stdlib such a part is "multipart" — its payload is the inner
+    message — so walking into it would splice the inner body into ours and drop
+    the attachment. Returns None if the inner message cannot be serialized."""
+    inner = next(iter(part.iter_parts()), None)
+    if inner is None:
+        return None
+    try:
+        data = inner.as_bytes(policy=policy.SMTP)
+    except Exception:  # noqa: BLE001 - fall back to the message's own policy
+        try:
+            data = inner.as_bytes()
+        except Exception as exc:  # noqa: BLE001 - best-effort fidelity
+            log.warning("Could not serialize attached message: %s", exc)
+            return None
+    name = part.get_filename()
+    if not name:
+        subject = str(inner.get("Subject", "") or "Attached message")
+        name = f"{subject[:120]}.eml"
+    return name.replace("\r", " ").replace("\n", " "), data
+
+
 def _graph_body_and_attachments(msg: Any) -> tuple[dict[str, str], list[dict[str, Any]]]:
     html_parts: list[str] = []
     text_parts: list[str] = []
     attachments: list[dict[str, Any]] = []
-    for part in msg.walk():
+
+    def visit(part: Any) -> None:
+        if part.get_content_type() == "message/rfc822":
+            if (eml := _rfc822_bytes(part)) is not None:
+                eml_name, eml_bytes = eml
+                attachments.append({
+                    "@odata.type": "#microsoft.graph.fileAttachment",
+                    "name": eml_name,
+                    "contentType": "message/rfc822",
+                    "contentBytes": base64.b64encode(eml_bytes).decode(),
+                })
+            return
         if part.is_multipart():
-            continue
+            for sub in part.iter_parts():
+                visit(sub)
+            return
         ctype = part.get_content_type()
         disp = part.get_content_disposition()
         filename = part.get_filename()
@@ -359,6 +524,8 @@ def _graph_body_and_attachments(msg: Any) -> tuple[dict[str, str], list[dict[str
             html_parts.append(str(part.get_content()))
         elif ctype == "text/plain":
             text_parts.append(str(part.get_content()))
+
+    visit(msg)
     if html_parts:
         return {"contentType": "html", "content": "".join(html_parts)}, attachments
     return {"contentType": "text", "content": "".join(text_parts)}, attachments
@@ -466,6 +633,14 @@ def _split_large_attachments(raw_mime: bytes) -> tuple[bytes, list[tuple[str, st
     # type the recursion usefully, so we keep it Any and coerce at the edges.
     def prune(part: Any) -> bool:
         """Return True if `part` is an attachment the parent should drop."""
+        if part.get_content_type() == "message/rfc822":
+            # Attached email: extract whole (never descend into it — pruning its
+            # inner attachments would mangle the forwarded message).
+            if part.get_content_disposition() == "attachment":
+                if (eml := _rfc822_bytes(part)) is not None:
+                    attachments.append((eml[0], "message/rfc822", eml[1]))
+                    return True
+            return False
         if part.is_multipart():
             kept = [child for child in part.iter_parts() if not prune(child)]
             part.set_payload(kept)
@@ -488,34 +663,44 @@ def _add_attachment(
     name: str,
     content_type: str,
     data: bytes,
+    is_inline: bool = False,
+    content_id: str | None = None,
 ) -> None:
     size = len(data)
     content_type = content_type or "application/octet-stream"
 
     if size <= _LARGE_ATTACHMENT_THRESHOLD:
+        att: dict[str, Any] = {
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": name,
+            "contentType": content_type,
+            "contentBytes": base64.b64encode(data).decode(),
+        }
+        if is_inline:
+            att["isInline"] = True
+            if content_id:
+                att["contentId"] = content_id
         gc.post(
             f"/users/{ms_user_id}/messages/{message_id}/attachments",
             user_key=ms_user_id,
-            json={
-                "@odata.type": "#microsoft.graph.fileAttachment",
-                "name": name,
-                "contentType": content_type,
-                "contentBytes": base64.b64encode(data).decode(),
-            },
+            json=att,
         )
         return
 
+    item: dict[str, Any] = {
+        "attachmentType": "file",
+        "name": name,
+        "size": size,
+        "contentType": content_type,
+    }
+    if is_inline:
+        item["isInline"] = True
+        if content_id:
+            item["contentId"] = content_id
     session = gc.post(
         f"/users/{ms_user_id}/messages/{message_id}/attachments/createUploadSession",
         user_key=ms_user_id,
-        json={
-            "AttachmentItem": {
-                "attachmentType": "file",
-                "name": name,
-                "size": size,
-                "contentType": content_type,
-            }
-        },
+        json={"AttachmentItem": item},
     )
     upload_url: str = session["uploadUrl"]
     offset = 0
@@ -527,6 +712,7 @@ def _add_attachment(
             data=chunk,
             user_key=ms_user_id,
             headers={
+                "Content-Type": "application/octet-stream",
                 "Content-Length": str(len(chunk)),
                 "Content-Range": f"bytes {offset}-{end - 1}/{size}",
             },
@@ -540,8 +726,11 @@ def patch_message_flags(
     message_id: str,
     is_read: bool,
     categories: list[str] | None = None,
+    is_flagged: bool = False,
 ) -> None:
     body: dict[str, Any] = {"isRead": is_read}
     if categories:
         body["categories"] = categories
+    if is_flagged:
+        body["flag"] = {"flagStatus": "flagged"}
     gc.patch(f"/users/{ms_user_id}/messages/{message_id}", user_key=ms_user_id, json=body)

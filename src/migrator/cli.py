@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -11,6 +12,7 @@ from rich.logging import RichHandler
 from .config import Config, UserMapping, load_config
 from .connectors.factory import source_capabilities
 from .orchestrator import JobFn, Orchestrator
+from .state.db import count_failed_items_since, session_scope
 
 app = typer.Typer(help="Multi-source → Microsoft 365 migration tool", no_args_is_help=True)
 console = Console()
@@ -38,7 +40,19 @@ def _build_orchestrator(config_path: Path) -> Orchestrator:
 
 
 def _filter_users(cfg: Config, user: str | None) -> list[UserMapping] | None:
-    return [u for u in cfg.users if u.source_id == user] if user else None
+    """`--user` narrows the run to one mapping; None means every configured user.
+
+    A `--user` that matches nothing is an error, never a fall-through to all
+    users — a typo must not migrate the whole tenant."""
+    if not user:
+        return None
+    matched = [u for u in cfg.users if u.source_id == user]
+    if not matched:
+        console.print(
+            f"[red]--user {user!r} does not match any configured source_id; nothing run."
+        )
+        raise typer.Exit(1)
+    return matched
 
 
 def _require_capability(cfg: Config, workload: str) -> None:
@@ -66,16 +80,36 @@ def _job_fn(workload: str) -> JobFn:
     return fns[workload]
 
 
+def _utc_now_naive() -> datetime:
+    # ItemMap.updated_at stores SQLite CURRENT_TIMESTAMP (naive UTC).
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+def _exit_if_failures(failed_users: int, since: datetime) -> None:
+    """Exit 1 when the run left anything behind — a failed user-level run or
+    failed items — so scripted cutovers can't mistake a bad run for success."""
+    with session_scope() as s:
+        failed_items = count_failed_items_since(s, since)
+    if failed_users or failed_items:
+        console.print(
+            f"[red]Run finished with failures: {failed_users} user run(s), "
+            f"{failed_items} item(s). State is kept — re-run to retry."
+        )
+        raise typer.Exit(1)
+
+
 def _run_single(workload: str, config: Path, user: str | None, mode: str = "full") -> None:
     orch = _build_orchestrator(config)
     _require_capability(orch.config, workload)
-    orch.run_workload(
+    started = _utc_now_naive()
+    failed_users = orch.run_workload(
         workload,
         _job_fn(workload),
         mode=mode,
         max_workers=getattr(orch.config.workloads, workload).concurrency,
         users=_filter_users(orch.config, user),
     )
+    _exit_if_failures(failed_users, started)
 
 
 @app.command()
@@ -126,7 +160,9 @@ def shared_drives(
     if orch.config.source.type != "google_workspace":
         console.print("[red]shared-drives is only available for a google_workspace source.")
         raise typer.Exit(1)
+    started = _utc_now_naive()
     orch.run_shared_drives(mode="delta" if delta else "full")
+    _exit_if_failures(0, started)
 
 
 @app.command()
@@ -141,7 +177,9 @@ def sharepoint(
     if orch.config.source.type != "microsoft365":
         console.print("[red]sharepoint is only available for a microsoft365 source.")
         raise typer.Exit(1)
+    started = _utc_now_naive()
     orch.run_sharepoint_sites(mode="delta" if delta else "full")
+    _exit_if_failures(0, started)
 
 
 @app.command("run-all")
@@ -154,6 +192,8 @@ def run_all(
     cfg = orch.config
     caps = source_capabilities(cfg)
     users = _filter_users(cfg, user)
+    started = _utc_now_naive()
+    failed_users = 0
     for workload in _WORKLOAD_ORDER:
         wcfg = getattr(cfg.workloads, workload)
         if not wcfg.enabled:
@@ -163,7 +203,10 @@ def run_all(
                 f"[yellow]Skipping '{workload}' — unsupported by source '{cfg.source.type}'."
             )
             continue
-        orch.run_workload(workload, _job_fn(workload), max_workers=wcfg.concurrency, users=users)
+        failed_users += orch.run_workload(
+            workload, _job_fn(workload), max_workers=wcfg.concurrency, users=users
+        )
+    _exit_if_failures(failed_users, started)
 
 
 @app.command()
@@ -176,13 +219,16 @@ def delta(
     cfg = orch.config
     caps = source_capabilities(cfg)
     users = _filter_users(cfg, user)
+    started = _utc_now_naive()
+    failed_users = 0
     for workload in _WORKLOAD_ORDER:
         wcfg = getattr(cfg.workloads, workload)
         if not wcfg.enabled or workload not in caps:
             continue
-        orch.run_workload(
+        failed_users += orch.run_workload(
             workload, _job_fn(workload), mode="delta", max_workers=wcfg.concurrency, users=users
         )
+    _exit_if_failures(failed_users, started)
 
 
 @app.command()

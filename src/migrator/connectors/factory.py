@@ -36,7 +36,11 @@ def build_source(
     if isinstance(src, GoogleWorkspaceSourceConfig):
         from .google import GoogleWorkspaceSource
 
-        return GoogleWorkspaceSource(src, cfg.workloads.mail.multi_label_policy)
+        return GoogleWorkspaceSource(
+            src,
+            cfg.workloads.mail.multi_label_policy,
+            include_spam_trash=cfg.workloads.mail.include_spam_trash,
+        )
 
     if isinstance(src, ImapSourceConfig):
         from .imap import ImapSource

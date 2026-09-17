@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from typing import Any
+
+import httpx
 
 from ..config import Microsoft365SourceConfig, UserMapping
 from ..microsoft.graph_client import GraphClient
@@ -32,6 +35,8 @@ _EVENT_FIELDS = (
 
 _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
+log = logging.getLogger(__name__)
+
 # Graph wellKnownName → canonical token shared with the destination writer
 # (microsoft/mail.py:WELL_KNOWN_FOLDER_IDS) and the other sources, so a system
 # folder maps to the real well-known destination folder rather than a duplicate.
@@ -56,6 +61,14 @@ def _now_z() -> str:
 
 def _whitelist(src: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
     return {k: src[k] for k in keys if k in src and src[k] is not None}
+
+
+def _drive_key(drive_root: str) -> str:
+    """Rate-limiter key for a drive prefix: the user id of "users/<id>/drive" or
+    the drive id of "drives/<id>" — the same key _iter_drive uses, so reads and
+    content fetches of one drive share a bucket."""
+    parts = drive_root.split("/")
+    return parts[1] if len(parts) > 1 else drive_root
 
 
 class M365Source(BaseSource):
@@ -124,10 +137,23 @@ class M365Source(BaseSource):
         if since:
             path += f"&$filter=receivedDateTime ge {since}"
         for msg in self._paginate(path, user_key=uid):
-            raw = self._client().get_bytes(
-                f"/users/{uid}/messages/{msg['id']}/$value", user_key=uid
-            )
             folder = folder_paths.get(msg.get("parentFolderId", ""), "Inbox")
+            try:
+                raw = self._client().get_bytes(
+                    f"/users/{uid}/messages/{msg['id']}/$value",
+                    user_key=uid, quiet_statuses=(404,),
+                )
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 404:
+                    # Deleted between list and fetch — nothing to migrate.
+                    log.warning("Message %s vanished before fetch — skipping", msg["id"])
+                    continue
+                # Retries are exhausted at this point; fail just this item.
+                yield SourceMessage(
+                    source_id=msg["id"], raw_mime=b"", folder_paths=[folder],
+                    fetch_error=f"{exc.response.status_code}: {exc.response.text[:200]}",
+                )
+                continue
             yield SourceMessage(
                 source_id=msg["id"],
                 raw_mime=raw,
@@ -172,6 +198,10 @@ class M365Source(BaseSource):
             for item in data.get("value", []):
                 if "root" in item:
                     continue  # skip the drive root pseudo-item
+                if "deleted" in item:
+                    # Delta feeds return tombstones with the `deleted` facet (no
+                    # name/file/folder); there is nothing to migrate for them.
+                    continue
                 yield self._to_file(item, drive_root)
             next_link = data.get("@odata.nextLink")
             delta_link = data.get("@odata.deltaLink") or delta_link
@@ -212,7 +242,7 @@ class M365Source(BaseSource):
     def fetch_file(self, user: UserMapping, f: SourceFile) -> tuple[bytes, str]:
         drive_root = f.drive_root or f"users/{self._uid(user)}/drive"
         content = self._client().get_bytes(
-            f"/{drive_root}/items/{f.source_id}/content", user_key=drive_root
+            f"/{drive_root}/items/{f.source_id}/content", user_key=_drive_key(drive_root)
         )
         return content, f.name
 
@@ -220,28 +250,74 @@ class M365Source(BaseSource):
         yield from self.iter_files(user, None)
 
     # -- contacts ----------------------------------------------------------- #
+    def _contact_collections(self, uid: str) -> list[tuple[str, str]]:
+        """(collection path, destination folder name) for the default Contacts
+        folder and every contact sub-folder. `/users/{id}/contacts` alone is
+        *only* the default folder, so sub-folder contacts would otherwise never
+        be migrated. Nested folders are flattened to their display name."""
+        out = [(f"/users/{uid}/contacts", "Imported Contacts")]
+
+        def walk(container: str) -> None:
+            for f in self._paginate(
+                f"/users/{uid}/{container}?$top=100&$select=id,displayName", user_key=uid
+            ):
+                name = f.get("displayName") or "Imported Contacts"
+                out.append((f"/users/{uid}/contactFolders/{f['id']}/contacts", name))
+                walk(f"contactFolders/{f['id']}/childFolders")
+
+        walk("contactFolders")
+        return out
+
+    def _iter_contact_collections(
+        self, uid: str, since: str | None
+    ) -> Iterator[SourceContact]:
+        for path, folder_name in self._contact_collections(uid):
+            query = f"{path}?$top=100"
+            if since:
+                query += f"&$filter=lastModifiedDateTime ge {since}"
+            for c in self._paginate(query, user_key=uid):
+                yield self._to_contact(c, path, folder_name)
+
     def iter_contacts(self, user: UserMapping, since: str | None) -> Iterator[SourceContact]:
         uid = self._uid(user)
         self._set_cursor("contacts", _now_z())
-        path = f"/users/{uid}/contacts?$top=100"
-        if since:
-            path += f"&$filter=lastModifiedDateTime ge {since}"
-        for c in self._paginate(path, user_key=uid):
-            yield self._to_contact(c)
+        yield from self._iter_contact_collections(uid, since)
 
     def inventory_contacts(self, user: UserMapping) -> Iterator[SourceContact]:
-        uid = self._uid(user)
-        for c in self._paginate(f"/users/{uid}/contacts?$top=100", user_key=uid):
-            yield self._to_contact(c)
+        yield from self._iter_contact_collections(self._uid(user), None)
 
-    def _to_contact(self, c: dict[str, Any]) -> SourceContact:
+    def _to_contact(
+        self, c: dict[str, Any], collection: str, folder_name: str = "Imported Contacts"
+    ) -> SourceContact:
         emails = c.get("emailAddresses", []) or []
         return SourceContact(
             source_id=c["id"],
             graph_body=_whitelist(c, _CONTACT_FIELDS),
+            folder_name=folder_name,
+            # Full contact path (folder-qualified) so the lazy photo fetch
+            # addresses sub-folder contacts too.
+            photo_ref=f"{collection}/{c['id']}",
+            source_hash=c.get("changeKey", ""),
             display_name=c.get("displayName", ""),
             primary_email=emails[0].get("address", "") if emails else "",
         )
+
+    def fetch_contact_photo(self, user: UserMapping, contact: SourceContact) -> bytes | None:
+        if not contact.photo_ref:
+            return None
+        uid = self._uid(user)
+        try:
+            # Most contacts have no photo; 404 is the expected "none" answer,
+            # so it is quieted rather than logged as a Graph error.
+            return self._client().get_bytes(
+                f"{contact.photo_ref}/photo/$value",
+                user_key=uid,
+                quiet_statuses=(404,),
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return None
+            raise
 
     # -- calendar ----------------------------------------------------------- #
     def list_calendars(self, user: UserMapping) -> list[CalendarRef]:
@@ -265,6 +341,7 @@ class M365Source(BaseSource):
                 source_id=e["id"],
                 graph_body={} if cancelled else _whitelist(e, _EVENT_FIELDS),
                 is_cancelled=cancelled,
+                source_hash=e.get("changeKey", ""),
                 subject=e.get("subject", "(No title)"),
                 modified_time=e.get("lastModifiedDateTime", ""),
                 notes="recurring" if e.get("recurrence") else "",

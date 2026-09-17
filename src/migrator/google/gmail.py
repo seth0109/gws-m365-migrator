@@ -5,9 +5,12 @@ import logging
 from collections.abc import Generator
 from typing import Any
 
+from googleapiclient.errors import HttpError
+
 from ..auth.google_auth import build_service
 from ..config import GoogleConfig
 from ..ratelimit import registry
+from . import NUM_RETRIES
 
 log = logging.getLogger(__name__)
 
@@ -18,7 +21,7 @@ def _svc(cfg: GoogleConfig, email: str):
 
 def list_labels(cfg: GoogleConfig, user_email: str) -> list[dict[str, Any]]:
     svc = _svc(cfg, user_email)
-    result = svc.users().labels().list(userId="me").execute()
+    result = svc.users().labels().list(userId="me").execute(num_retries=NUM_RETRIES)
     return result.get("labels", [])
 
 
@@ -27,20 +30,34 @@ def iter_messages(
     user_email: str,
     label_ids: list[str] | None = None,
     history_id: str | None = None,
+    include_spam_trash: bool = False,
 ) -> Generator[dict[str, Any], None, None]:
     """Yield full raw MIME message dicts, one at a time.
 
     If *history_id* is set, yields only messages changed since that point (delta pass).
+    Spam/Trash are excluded by the API unless *include_spam_trash* is set.
     """
     svc = _svc(cfg, user_email)
 
     if history_id:
-        yield from _iter_history(svc, user_email, history_id)
-        return
+        try:
+            yield from _iter_history(svc, user_email, history_id)
+            return
+        except HttpError as exc:
+            if exc.resp.status != 404:
+                raise
+            # An expired historyId (typically valid ~1 week) returns 404; the
+            # Gmail docs say to perform a full sync in that case. Idempotency
+            # (is_done) makes re-enumerating everything safe, just slower.
+            log.warning(
+                "Gmail history id expired for %s — falling back to full sync", user_email
+            )
 
     params: dict[str, Any] = {"userId": "me", "maxResults": 500}
     if label_ids:
         params["labelIds"] = label_ids
+    if include_spam_trash:
+        params["includeSpamTrash"] = True
 
     page_token = None
     while True:
@@ -50,21 +67,48 @@ def iter_messages(
             registry.acquire("google_global")
         except KeyError:
             pass
-        resp = svc.users().messages().list(**params).execute()
-        messages = resp.get("messages", [])
-        for stub in messages:
-            try:
-                registry.acquire("google_global")
-            except KeyError:
-                pass
-            msg = svc.users().messages().get(userId="me", id=stub["id"], format="raw").execute()
-            yield msg
+        resp = svc.users().messages().list(**params).execute(num_retries=NUM_RETRIES)
+        for stub in resp.get("messages", []):
+            msg = _get_raw(svc, user_email, stub["id"])
+            if msg is not None:
+                yield msg
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
 
 
-def _iter_history(svc: Any, user_email: str, start_history_id: str) -> Generator[dict, None, None]:
+def _get_raw(svc: Any, user_email: str, msg_id: str) -> dict[str, Any] | None:
+    """Fetch one message as raw MIME.
+
+    A 404 means it was deleted between list and get (Gmail documents this for
+    history `messagesAdded` records) — skip it. Any other error comes back as a
+    ``fetch_error`` stub so the job fails just that item and holds the cursor,
+    instead of the exception killing the generator and the whole mailbox run."""
+    try:
+        registry.acquire("google_global")
+    except KeyError:
+        pass
+    try:
+        msg: dict[str, Any] = (
+            svc.users()
+            .messages()
+            .get(userId="me", id=msg_id, format="raw")
+            .execute(num_retries=NUM_RETRIES)
+        )
+        return msg
+    except HttpError as exc:
+        if exc.resp.status == 404:
+            log.warning(
+                "Message %s for %s vanished before fetch — skipping", msg_id, user_email
+            )
+            return None
+        log.error("Fetching message %s for %s failed: %s", msg_id, user_email, exc)
+        return {"id": msg_id, "fetch_error": str(exc)}
+
+
+def _iter_history(
+    svc: Any, user_email: str, start_history_id: str
+) -> Generator[dict[str, Any], None, None]:
     params = {"userId": "me", "startHistoryId": start_history_id, "historyTypes": ["messageAdded"]}
     page_token = None
     while True:
@@ -74,15 +118,12 @@ def _iter_history(svc: Any, user_email: str, start_history_id: str) -> Generator
             registry.acquire("google_global")
         except KeyError:
             pass
-        resp = svc.users().history().list(**params).execute()
+        resp = svc.users().history().list(**params).execute(num_retries=NUM_RETRIES)
         for record in resp.get("history", []):
             for added in record.get("messagesAdded", []):
-                msg_id = added["message"]["id"]
-                try:
-                    registry.acquire("google_global")
-                except KeyError:
-                    pass
-                yield svc.users().messages().get(userId="me", id=msg_id, format="raw").execute()
+                msg = _get_raw(svc, user_email, added["message"]["id"])
+                if msg is not None:
+                    yield msg
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
@@ -91,6 +132,7 @@ def _iter_history(svc: Any, user_email: str, start_history_id: str) -> Generator
 def iter_message_metadata(
     cfg: GoogleConfig,
     user_email: str,
+    include_spam_trash: bool = False,
 ) -> Generator[dict[str, Any], None, None]:
     """Yield lightweight message metadata (no raw MIME body) for inventory/whatif.
 
@@ -99,6 +141,8 @@ def iter_message_metadata(
     """
     svc = _svc(cfg, user_email)
     params: dict[str, Any] = {"userId": "me", "maxResults": 500}
+    if include_spam_trash:
+        params["includeSpamTrash"] = True
     page_token: str | None = None
     header_names = ["Subject", "From", "To", "Date", "Message-ID"]
 
@@ -109,7 +153,7 @@ def iter_message_metadata(
             registry.acquire("google_global")
         except KeyError:
             pass
-        resp = svc.users().messages().list(**params).execute()
+        resp = svc.users().messages().list(**params).execute(num_retries=NUM_RETRIES)
         for stub in resp.get("messages", []):
             try:
                 registry.acquire("google_global")
@@ -120,7 +164,7 @@ def iter_message_metadata(
                 id=stub["id"],
                 format="metadata",
                 metadataHeaders=header_names,
-            ).execute()
+            ).execute(num_retries=NUM_RETRIES)
             headers = {
                 h["name"]: h["value"]
                 for h in msg.get("payload", {}).get("headers", [])
@@ -141,7 +185,7 @@ def iter_message_metadata(
 
 def get_history_id(cfg: GoogleConfig, user_email: str) -> str:
     svc = _svc(cfg, user_email)
-    profile = svc.users().getProfile(userId="me").execute()
+    profile = svc.users().getProfile(userId="me").execute(num_retries=NUM_RETRIES)
     return str(profile["historyId"])
 
 

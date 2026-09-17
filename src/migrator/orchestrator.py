@@ -144,10 +144,15 @@ class Orchestrator:
         mode: str = "full",
         max_workers: int = 4,
         users: list[UserMapping] | None = None,
-    ) -> None:
-        target_users = users or self.config.users
+    ) -> int:
+        """Run one workload across users; returns the number of users whose run
+        failed outright (item-level failures live in ItemMap)."""
+        # None = every configured user; an explicit (even empty) list is honoured
+        # as-is so a caller's filter can never widen into a whole-tenant run.
+        target_users = self.config.users if users is None else users
         log.info("Starting workload=%s mode=%s users=%d", workload_name, mode, len(target_users))
 
+        failed = 0
         with Progress(
             SpinnerColumn(),
             TextColumn("[bold blue]{task.description}"),
@@ -166,9 +171,11 @@ class Orchestrator:
                         future.result()
                         log.info("Completed %s for %s", workload_name, user.source_id)
                     except Exception:
+                        failed += 1
                         log.exception("Failed %s for %s", workload_name, user.source_id)
                     finally:
                         progress.advance(task)
+        return failed
 
     def _run_user(
         self,

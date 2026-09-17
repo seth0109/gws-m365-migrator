@@ -9,10 +9,10 @@ SYSTEM_LABEL_FOLDER = {
     "DRAFT": "Drafts",
     "TRASH": "DeletedItems",
     "SPAM": "JunkEmail",
-    "STARRED": None,    # handled as Outlook flag
-    "IMPORTANT": None,  # handled as category
+    "STARRED": None,    # → SourceMessage.is_flagged (set by the connector)
+    "IMPORTANT": None,  # → "Important" category (set by the connector)
     "CHAT": None,       # skip — Chat is out of scope
-    "UNREAD": None,     # handled via isRead flag
+    "UNREAD": None,     # → SourceMessage.is_read (set by the connector)
 }
 
 MultiLabelPolicy = Literal["categories", "duplicate"]

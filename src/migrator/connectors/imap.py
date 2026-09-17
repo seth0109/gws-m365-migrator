@@ -147,7 +147,11 @@ class ImapSource(BaseSource):
                     continue  # no new messages in this folder
 
             conn.select(self._quote(folder.raw_name), readonly=True)
-            typ, data = conn.uid("search", f"{start_uid}:*")
+            # A bare set in `UID SEARCH <set>` is *message sequence numbers*
+            # (RFC 3501 §6.4.8); only a UID-prefixed set is a UID range. Without
+            # the prefix, mail that arrived after expunges (sequence numbers
+            # below the stored UIDNEXT) is skipped while the cursor advances.
+            typ, data = conn.uid("search", "UID", f"{start_uid}:*")
             if typ != "OK" or not data or not data[0]:
                 continue
             for uid_b in data[0].split():
@@ -161,23 +165,48 @@ class ImapSource(BaseSource):
     def _fetch_message(
         self, conn: imaplib.IMAP4, folder: _Folder, uid: int, uidvalidity: int
     ) -> SourceMessage:
-        typ, data = conn.uid("fetch", str(uid), "(RFC822 FLAGS)")
+        source_id = f"{folder.raw_name}:{uidvalidity}:{uid}"
+        try:
+            typ, data = conn.uid("fetch", str(uid), "(FLAGS RFC822)")
+        except imaplib.IMAP4.abort:
+            raise  # the connection is unusable; let the run fail and reconnect next time
+        except imaplib.IMAP4.error as exc:
+            return self._fetch_failed(source_id, folder, f"IMAP FETCH failed: {exc}")
+        if typ != "OK":
+            return self._fetch_failed(source_id, folder, f"IMAP FETCH returned {typ}")
         raw_bytes = b""
-        flags: tuple[bytes, ...] = ()
+        flag_parts: list[bytes] = []
+        # Servers return FETCH items in their own order: FLAGS may sit in the
+        # tuple prefix ("1 (UID 5 FLAGS (\\Seen) RFC822 {n}") or, when RFC822 is
+        # answered first, in a trailing bytes element after the literal
+        # (" FLAGS (\\Seen))"). Scan every part or read state is lost.
         for part in data:
             if isinstance(part, tuple):
-                flags = imaplib.ParseFlags(part[0])
+                flag_parts.append(part[0])
                 raw_bytes = part[1] or b""
+            elif isinstance(part, bytes):
+                flag_parts.append(part)
+        if not raw_bytes:
+            return self._fetch_failed(source_id, folder, "IMAP FETCH returned no RFC822 body")
+        flags = tuple(f for p in flag_parts for f in imaplib.ParseFlags(p))
         flag_str = " ".join(f.decode("ascii", "replace") for f in flags)
         parsed = email_lib.message_from_bytes(raw_bytes)
         return SourceMessage(
-            source_id=f"{folder.raw_name}:{uidvalidity}:{uid}",
+            source_id=source_id,
             raw_mime=raw_bytes,
             folder_paths=[folder.mapped_path],
             is_read="\\Seen" in flag_str,
             is_flagged="\\Flagged" in flag_str,
-            dedup_hash=parsed.get("Message-ID", f"{folder.raw_name}:{uidvalidity}:{uid}"),
+            dedup_hash=parsed.get("Message-ID", source_id),
             subject=parsed.get("Subject", ""),
+        )
+
+    @staticmethod
+    def _fetch_failed(source_id: str, folder: _Folder, error: str) -> SourceMessage:
+        log.warning("Could not fetch %s: %s", source_id, error)
+        return SourceMessage(
+            source_id=source_id, raw_mime=b"", folder_paths=[folder.mapped_path],
+            fetch_error=error,
         )
 
     def inventory_messages(self, user: UserMapping) -> Iterator[SourceMessage]:

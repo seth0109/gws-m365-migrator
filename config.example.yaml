@@ -28,6 +28,10 @@ destination:
   certificate_thumbprint: "AABBCCDDEEFF..."
   # client_secret: "optional-if-not-using-cert"
   token_cache_file: .ms_token_cache.json
+  # Owner for auto-provisioned SharePoint sites (shared-drives / sharepoint
+  # commands). Effectively required: app-only groups created without an owner
+  # may never get their site provisioned.
+  # sharepoint_site_owner: admin@yourdomain.com
 
 # ── USER MAPPINGS (source identity → destination UPN) ───────────────────────
 users:
@@ -61,6 +65,12 @@ workloads:
     concurrency: 2
     # "categories" (default) or "duplicate"
     multi_label_policy: categories
+    # "json" (default): messages arrive as normal non-draft mail with original
+    # sent/received dates (MAPI extended properties). "mime": byte-perfect MIME
+    # import, but Graph creates every message as a draft dated at import time.
+    import_mode: json
+    # Migrate Gmail Spam/Trash too (→ JunkEmail / DeletedItems). Default true.
+    include_spam_trash: true
 
 rate_limits:
   google_requests_per_second: 10

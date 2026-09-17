@@ -6,6 +6,7 @@ from typing import Any
 from ..auth.google_auth import build_service
 from ..config import GoogleConfig
 from ..ratelimit import registry
+from . import NUM_RETRIES
 
 log = logging.getLogger(__name__)
 
@@ -20,7 +21,7 @@ def list_calendars(cfg: GoogleConfig, user_email: str) -> list[dict[str, Any]]:
         registry.acquire("google_global")
     except KeyError:
         pass
-    resp = svc.calendarList().list().execute()
+    resp = svc.calendarList().list().execute(num_retries=NUM_RETRIES)
     return resp.get("items", [])
 
 
@@ -50,7 +51,7 @@ def iter_events(
             registry.acquire("google_global")
         except KeyError:
             pass
-        resp = svc.events().list(**params).execute()
+        resp = svc.events().list(**params).execute(num_retries=NUM_RETRIES)
         events.extend(resp.get("items", []))
         next_token = resp.get("nextPageToken")
         if not next_token:

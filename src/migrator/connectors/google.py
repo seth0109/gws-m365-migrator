@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import email as email_lib
+import logging
+import re
 from collections.abc import Iterator
 from typing import Any
+
+import httpx
 
 from ..config import GoogleWorkspaceSourceConfig, UserMapping
 from ..google.calendar import iter_events, list_calendars
@@ -37,6 +41,8 @@ from .base import (
     SourceMessage,
 )
 
+log = logging.getLogger(__name__)
+
 _FOLDER_MIME = "application/vnd.google-apps.folder"
 
 
@@ -45,10 +51,16 @@ class GoogleWorkspaceSource(BaseSource):
 
     capabilities = {"mail", "files", "contacts", "calendar"}
 
-    def __init__(self, cfg: GoogleWorkspaceSourceConfig, mail_policy: MultiLabelPolicy) -> None:
+    def __init__(
+        self,
+        cfg: GoogleWorkspaceSourceConfig,
+        mail_policy: MultiLabelPolicy,
+        include_spam_trash: bool = True,
+    ) -> None:
         super().__init__()
         self.cfg = cfg
         self.mail_policy = mail_policy
+        self.include_spam_trash = include_spam_trash
 
     # -- mail --------------------------------------------------------------- #
     def _label_map(self, user: UserMapping) -> dict[str, str]:
@@ -60,19 +72,26 @@ class GoogleWorkspaceSource(BaseSource):
             # Capture the history cursor before reading so the delta pass sees
             # everything that arrives during this run.
             self._set_cursor("mail", get_history_id(self.cfg, user.source_id))
-        for msg in iter_messages(self.cfg, user.source_id, history_id=since):
+        for msg in iter_messages(
+            self.cfg, user.source_id, history_id=since,
+            include_spam_trash=self.include_spam_trash,
+        ):
             yield self._to_message(msg, label_map)
 
     def inventory_messages(self, user: UserMapping) -> Iterator[SourceMessage]:
         label_map = self._label_map(user)
-        for msg in iter_message_metadata(self.cfg, user.source_id):
+        for msg in iter_message_metadata(
+            self.cfg, user.source_id, include_spam_trash=self.include_spam_trash
+        ):
             msg_id = msg.get("id", "")
             if not msg_id:
                 continue
             label_ids = msg.get("labelIds", [])
             folder_paths, categories = resolve_label_placement(
-            label_ids, label_map, self.mail_policy
-        )
+                label_ids, label_map, self.mail_policy
+            )
+            if "IMPORTANT" in label_ids:
+                categories = [*categories, "Important"]
             headers = msg.get("headers", {})
             yield SourceMessage(
                 source_id=msg_id,
@@ -80,6 +99,7 @@ class GoogleWorkspaceSource(BaseSource):
                 folder_paths=folder_paths,
                 categories=categories,
                 is_read="UNREAD" not in label_ids,
+                is_flagged="STARRED" in label_ids,
                 subject=headers.get("Subject", "(no subject)"),
                 size_bytes=msg.get("sizeEstimate", ""),
                 date=headers.get("Date", ""),
@@ -88,18 +108,29 @@ class GoogleWorkspaceSource(BaseSource):
 
     def _to_message(self, msg: dict[str, Any], label_map: dict[str, str]) -> SourceMessage:
         msg_id = msg.get("id", "")
+        if fetch_error := msg.get("fetch_error"):
+            return SourceMessage(
+                source_id=msg_id, raw_mime=b"", folder_paths=["Inbox"],
+                fetch_error=str(fetch_error),
+            )
         raw_bytes = decode_raw_mime(msg.get("raw", ""))
         parsed = email_lib.message_from_bytes(raw_bytes)
         label_ids = msg.get("labelIds", [])
         folder_paths, categories = resolve_label_placement(
             label_ids, label_map, self.mail_policy
         )
+        # System-label state rides on the message, not the folder mapping:
+        # STARRED → Outlook follow-up flag, IMPORTANT → a category (Outlook
+        # `importance` means sender-set priority — a different concept).
+        if "IMPORTANT" in label_ids:
+            categories = [*categories, "Important"]
         return SourceMessage(
             source_id=msg_id,
             raw_mime=raw_bytes,
             folder_paths=folder_paths,
             categories=categories,
             is_read="UNREAD" not in label_ids,
+            is_flagged="STARRED" in label_ids,
             dedup_hash=parsed.get("Message-ID", msg_id),
             subject=parsed.get("Subject", ""),
         )
@@ -227,6 +258,19 @@ class GoogleWorkspaceSource(BaseSource):
             if g.get("resourceName")
         }
 
+    def fetch_contact_photo(self, user: UserMapping, contact: SourceContact) -> bytes | None:
+        if not contact.photo_ref:
+            return None
+        # People photo URLs are token-authenticated and directly fetchable, but
+        # default to a small thumbnail (...=s100); ask for a usable size.
+        url = re.sub(r"=s\d+(-c)?$", "=s512", contact.photo_ref)
+        resp = httpx.get(url, timeout=30.0, follow_redirects=True)
+        if resp.status_code != 200:
+            return None
+        if not resp.headers.get("content-type", "").startswith("image/"):
+            return None
+        return resp.content
+
     def _to_contact(self, contact: dict[str, Any], group_names: dict[str, str]) -> SourceContact:
         resource_name = contact.get("resourceName", "")
         source_id = resource_name.replace("people/", "")
@@ -250,11 +294,22 @@ class GoogleWorkspaceSource(BaseSource):
         display_name = names[0].get("displayName", "") if names else ""
         emails = contact.get("emailAddresses", [])
         primary_email = emails[0].get("value", "") if emails else ""
+        # Real (user-set) photo only: `default: true` marks the generated
+        # initials avatar, which is not worth migrating.
+        photo_url = next(
+            (p.get("url", "") for p in contact.get("photos", []) if not p.get("default")),
+            "",
+        )
 
+        metadata = contact.get("metadata") or {}
         return SourceContact(
             source_id=source_id,
             graph_body=_map_contact(contact),
             folder_name=folder,
+            photo_ref=photo_url,
+            source_hash=contact.get("etag", ""),
+            # Incremental sync returns deleted people as tombstones.
+            is_deleted=bool(metadata.get("deleted")),
             display_name=display_name,
             primary_email=primary_email,
         )
@@ -283,13 +338,26 @@ class GoogleWorkspaceSource(BaseSource):
             modified = (
                 event.get("updated", "") or start.get("dateTime", "") or start.get("date", "")
             )
+            # A modified/cancelled single occurrence of a recurring series
+            # (singleEvents=False still returns these alongside the master).
+            master = event.get("recurringEventId", "")
+            original = event.get("originalStartTime", {}) or {}
+            if event.get("recurrence"):
+                note = "recurring"
+            elif master:
+                note = "recurrence exception"
+            else:
+                note = ""
             yield SourceEvent(
                 source_id=event_id,
                 graph_body={} if cancelled else _map_event(event),
                 is_cancelled=cancelled,
+                master_source_id=master,
+                original_start=original.get("dateTime") or original.get("date", ""),
+                source_hash=event.get("etag", ""),
                 subject=event.get("summary", "(No title)"),
                 modified_time=modified,
-                notes="recurring" if event.get("recurrence") else "",
+                notes=note,
             )
 
 
@@ -379,9 +447,18 @@ def _map_event(event: dict[str, Any]) -> dict[str, Any]:
     for rule in event.get("recurrence", []):
         if rule.startswith("RRULE:"):
             start_dt = start.get("dateTime") or start.get("date", "")
-            graph_rec = rrule_to_graph_recurrence(rule, start_dt)
+            graph_rec = None
+            try:
+                graph_rec = rrule_to_graph_recurrence(rule, start_dt)
+            except Exception as exc:  # noqa: BLE001 - one bad rule must not kill the run
+                log.warning("Recurrence rule %r failed to convert: %s", rule, exc)
             if graph_rec:
                 body["recurrence"] = graph_rec
+            else:
+                log.warning(
+                    "Recurrence %r not expressible in Graph — event %r migrates "
+                    "as a single occurrence", rule, event.get("summary", ""),
+                )
             break
 
     return body

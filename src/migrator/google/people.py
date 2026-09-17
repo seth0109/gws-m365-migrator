@@ -3,9 +3,12 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from googleapiclient.errors import HttpError
+
 from ..auth.google_auth import build_service
 from ..config import GoogleConfig
 from ..ratelimit import registry
+from . import NUM_RETRIES
 
 log = logging.getLogger(__name__)
 
@@ -37,13 +40,28 @@ def iter_contacts(
     }
     if sync_token:
         params["syncToken"] = sync_token
+    else:
+        # Without requestSyncToken the People API never returns nextSyncToken,
+        # so incremental contact syncs would silently never work.
+        params["requestSyncToken"] = True
 
     while True:
         try:
             registry.acquire("google_global")
         except KeyError:
             pass
-        resp = svc.people().connections().list(**params).execute()
+        try:
+            resp = svc.people().connections().list(**params).execute(num_retries=NUM_RETRIES)
+        except HttpError as exc:
+            if sync_token and exc.resp.status == 410:
+                # EXPIRED_SYNC_TOKEN (tokens last ~7 days): re-baseline with a
+                # fresh full sync rather than failing the contacts delta.
+                log.warning(
+                    "People sync token expired for %s — falling back to full sync",
+                    user_email,
+                )
+                return iter_contacts(cfg, user_email, None)
+            raise
         contacts.extend(resp.get("connections", []))
         next_token = resp.get("nextPageToken")
         if not next_token:
@@ -60,5 +78,5 @@ def list_contact_groups(cfg: GoogleConfig, user_email: str) -> list[dict[str, An
         registry.acquire("google_global")
     except KeyError:
         pass
-    resp = svc.contactGroups().list().execute()
+    resp = svc.contactGroups().list().execute(num_retries=NUM_RETRIES)
     return resp.get("contactGroups", [])

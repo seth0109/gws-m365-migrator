@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from collections.abc import Iterator
 from typing import Any
 
@@ -40,6 +39,35 @@ class ThrottledError(Exception):
         self.retry_after = retry_after
 
 
+def _parse_retry_after(value: str | None, default: int = 30) -> int:
+    """Retry-After may be missing or an HTTP-date rather than delta-seconds."""
+    if not value:
+        return default
+    try:
+        return max(1, int(value))
+    except ValueError:
+        return default
+
+
+_BACKOFF = wait_exponential(multiplier=1, min=2, max=60)
+
+
+def _throttle(retry_state: Any) -> httpx.HTTPStatusError | None:
+    """The 429 that failed this attempt, if that is what failed it."""
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+        return exc
+    return None
+
+
+def _wait(retry_state: Any) -> float:
+    """Sleep Retry-After on a 429 (once — the wait is not also backed off);
+    exponential backoff for everything else."""
+    if (exc := _throttle(retry_state)) is not None:
+        return float(_parse_retry_after(exc.response.headers.get("Retry-After")))
+    return float(_BACKOFF(retry_state))
+
+
 class GraphClient:
     """Thin httpx wrapper: auth injection, tenacity retry, 429/Retry-After, rate limiting."""
 
@@ -70,11 +98,11 @@ class GraphClient:
             pass
         self._client = httpx.Client(timeout=self._timeout)
 
-    def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
-        headers = {
-            "Authorization": f"Bearer {self._token_provider.get_token()}",
-            "Content-Type": "application/json",
-        }
+    def _headers(self, extra: dict[str, str] | None = None, *, auth: bool = True) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        if auth:
+            headers["Authorization"] = f"Bearer {self._token_provider.get_token()}"
+            headers["Content-Type"] = "application/json"
         if extra:
             headers.update(extra)  # caller may override Content-Type, add Content-Range, etc.
         return headers
@@ -94,10 +122,23 @@ class GraphClient:
         user_key: str | None = None,
         **kwargs: Any,
     ) -> httpx.Response:
-        self._apply_rate_limits(user_key)
         extra_headers = kwargs.pop("headers", None)
+        # Statuses the caller expects as a normal outcome (e.g. 404 on a
+        # contact photo probe) — still raised, but not logged as errors.
+        quiet_statuses: tuple[int, ...] = tuple(kwargs.pop("quiet_statuses", ()))
+        # Upload-session URLs (uploadUrl) are pre-authenticated; the Graph docs
+        # direct apps NOT to send Authorization on those PUTs (it can 401).
+        # Only requests to the Graph host get the bearer token + JSON default.
+        is_graph = url.startswith(GRAPH_BASE)
 
-        def _redial(_retry_state: Any) -> None:
+        def _redial(retry_state: Any) -> None:
+            # A 429 is the server's answer over a healthy socket — keep the pool.
+            if (exc := _throttle(retry_state)) is not None:
+                log.warning(
+                    "Graph 429 on %s — retrying after %ss", url,
+                    _parse_retry_after(exc.response.headers.get("Retry-After")),
+                )
+                return
             # Connection-level failure (server-disconnect, deserialize-400 from a
             # poisoned socket): discard the pool so the next attempt redials clean.
             self._reset_transport()
@@ -105,20 +146,19 @@ class GraphClient:
         @retry(
             retry=retry_if_exception(_is_retryable),
             stop=stop_after_attempt(_MAX_RETRIES),
-            wait=wait_exponential(multiplier=1, min=2, max=60),
+            wait=_wait,
             before_sleep=_redial,
             reraise=True,
         )
         def _do() -> httpx.Response:
+            # Inside the retried closure so retries never bypass the limiter.
+            self._apply_rate_limits(user_key)
             resp = self._client.request(
-                method, url, headers=self._headers(extra_headers), **kwargs
+                method, url, headers=self._headers(extra_headers, auth=is_graph), **kwargs
             )
             if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", "30"))
-                log.warning("Graph 429 on %s — sleeping %ss", url, retry_after)
-                time.sleep(retry_after)
-                resp.raise_for_status()  # trigger tenacity retry
-            if resp.status_code >= 400:
+                resp.raise_for_status()  # tenacity waits Retry-After (_wait) and retries
+            if resp.status_code >= 400 and resp.status_code not in quiet_statuses:
                 # Graph 4xx/5xx bodies carry the real reason (error.code/message);
                 # raise_for_status() drops them, so surface it before re-raising.
                 # Also echo the outgoing JSON body (truncated) — invaluable for
@@ -185,14 +225,21 @@ class GraphClient:
     ) -> Iterator[list[dict[str, Any]]]:
         """Yield pages from a Graph collection, following @odata.nextLink."""
         url: str | None = f"{GRAPH_BASE}{path}"
+        first = True
         while url:
+            kw = kwargs
+            if not first:
+                # nextLink already embeds the query ($top, skiptoken, ...) —
+                # re-sending the original params would duplicate them.
+                kw = {k: v for k, v in kwargs.items() if k != "params"}
             if url.startswith(GRAPH_BASE):
-                data = self.get(url[len(GRAPH_BASE):], user_key=user_key, **kwargs)
+                data = self.get(url[len(GRAPH_BASE):], user_key=user_key, **kw)
             else:
-                resp = self._request("GET", url, user_key=user_key, **kwargs)
+                resp = self._request("GET", url, user_key=user_key, **kw)
                 data = resp.json()
             yield data.get("value", [])
             url = data.get("@odata.nextLink")
+            first = False
 
     def close(self) -> None:
         self._client.close()

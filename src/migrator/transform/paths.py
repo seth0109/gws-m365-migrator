@@ -8,12 +8,15 @@ _ILLEGAL_CHARS = re.compile(r'[~#%&*{}\\:<>?/|"]+')
 _LEADING_TRAILING_SPACES = re.compile(r"^ +| +$", re.MULTILINE)
 _CONSECUTIVE_DOTS = re.compile(r"\.{2,}")
 
-# Windows reserved names
+# Windows reserved names (SharePoint rejects COM0/LPT0 too, unlike Windows)
 _RESERVED_NAMES = frozenset([
     "CON", "PRN", "AUX", "NUL",
-    *[f"COM{i}" for i in range(1, 10)],
-    *[f"LPT{i}" for i in range(1, 10)],
+    *[f"COM{i}" for i in range(10)],
+    *[f"LPT{i}" for i in range(10)],
 ])
+
+# Whole names OneDrive/SharePoint rejects outright (case-insensitive).
+_FORBIDDEN_NAMES = frozenset({"desktop.ini"})
 
 _SEGMENT_MAX = 128  # safe max per path segment
 
@@ -24,10 +27,17 @@ def sanitize_segment(name: str) -> str:
     name = _LEADING_TRAILING_SPACES.sub("", name)
     name = _CONSECUTIVE_DOTS.sub(".", name)
     name = name.strip(".")
+    # "_vti_" is rejected anywhere in a OneDrive/SharePoint name.
+    name = name.replace("_vti_", "_vti-")
     if not name:
         name = "_unnamed"
-    stem, _, ext = name.rpartition(".")
-    if stem.upper() in _RESERVED_NAMES:
+    # rpartition on a dotless name puts everything in `ext`; split explicitly so
+    # bare reserved names ("CON", "NUL") are caught too.
+    if "." in name:
+        stem, _, ext = name.rpartition(".")
+    else:
+        stem, ext = name, ""
+    if stem.upper() in _RESERVED_NAMES or name.lower() in _FORBIDDEN_NAMES:
         stem = f"{stem}_"
         name = f"{stem}.{ext}" if ext else stem
     if len(name) > _SEGMENT_MAX:

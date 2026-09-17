@@ -66,6 +66,11 @@ class Microsoft365DestinationConfig(BaseModel):
     certificate_thumbprint: str | None = None
     client_secret: str | None = None
     token_cache_file: Path = Path(".ms_token_cache.json")
+    # Owner (UPN or object id) stamped on auto-provisioned M365 groups/sites.
+    # Graph warns that groups created app-only *without* an owner may never get
+    # their SharePoint site provisioned — set this when using shared-drives or
+    # sharepoint auto-provisioning.
+    sharepoint_site_owner: str | None = None
 
 
 # Only one destination type exists today; alias kept for symmetry/extensibility.
@@ -133,6 +138,14 @@ class FilesWorkloadConfig(WorkloadConfig):
 
 class MailWorkloadConfig(WorkloadConfig):
     multi_label_policy: Literal["categories", "duplicate"] = "categories"
+    # Include Gmail Spam/Trash in the migration (they route to JunkEmail /
+    # DeletedItems). Off = those messages are silently left behind.
+    include_spam_trash: bool = True
+    # "json" (default) creates messages via the JSON API with MAPI extended
+    # properties so they arrive as normal non-draft mail with the original
+    # sent/received dates. "mime" posts raw MIME — byte-perfect content, but
+    # Graph documents that path as creating *drafts* dated at import time.
+    import_mode: Literal["json", "mime"] = "json"
 
 
 class WorkloadsConfig(BaseModel):

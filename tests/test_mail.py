@@ -235,8 +235,13 @@ def test_import_via_json_builds_message() -> None:
     # fidelity fields
     assert gm["from"]["emailAddress"]["address"] == "alice@x.com"  # type: ignore[index]
     assert gm["internetMessageId"] == "<abc123@x.com>"
-    assert str(gm["sentDateTime"]).startswith("2025-12-09T13:42:55")  # type: ignore[index]
-    assert gm["receivedDateTime"] == gm["sentDateTime"]
+    # dates travel as MAPI extended properties (UTC), not JSON date fields
+    assert "sentDateTime" not in gm
+    props = {p["id"]: p["value"] for p in gm["singleValueExtendedProperties"]}  # type: ignore[union-attr, index]
+    assert props["Integer 0x0E07"] == "1"  # non-draft, read
+    assert props["SystemTime 0x0039"] == "2025-12-09T21:42:55Z"  # -0800 folded into UTC
+    assert props["SystemTime 0x0E06"] == "2025-12-09T21:42:55Z"
+    assert "Subject: Hello" in props["String 0x007D"]  # original header block
     attachments = gm["attachments"]  # type: ignore[index]
     assert len(attachments) == 1
     assert attachments[0]["name"] == "f.bin"
@@ -278,4 +283,193 @@ def test_import_via_json_retries_minimal_when_fidelity_rejected() -> None:
     assert len(gc.bodies) == 2
     assert "from" in gc.bodies[0]
     assert "from" not in gc.bodies[1]
-    assert "sentDateTime" not in gc.bodies[1]
+    # the reduced retry keeps the create-time flags/dates (the whole point of
+    # the JSON path) and drops only the risky fidelity extras
+    reduced_props = {p["id"] for p in gc.bodies[1]["singleValueExtendedProperties"]}  # type: ignore[index, union-attr]
+    assert "Integer 0x0E07" in reduced_props
+    assert "String 0x007D" not in reduced_props
+
+
+class _RecordingGC:
+    def __init__(self) -> None:
+        self.posts: list[tuple[str, dict[str, object]]] = []
+
+    def post(self, path: str, user_key: str | None = None, **kwargs: object) -> dict[str, str]:
+        self.posts.append((path, kwargs))
+        return {"id": f"id-{len(self.posts)}"}
+
+
+def _simple_mime(unread_marker: str = "body") -> bytes:
+    from email.message import EmailMessage
+
+    m = EmailMessage()
+    m["Subject"] = "S"
+    m["From"] = "a@x.com"
+    m["To"] = "b@y.com"
+    m["Date"] = "Tue, 09 Dec 2025 13:42:55 +0000"
+    m.set_content(unread_marker)
+    return m.as_bytes()
+
+
+def test_import_json_message_unread_and_categories() -> None:
+    from migrator.microsoft.mail import import_json_message
+
+    gc = _RecordingGC()
+    import_json_message(
+        gc, "u", "inbox", _simple_mime(),  # type: ignore[arg-type]
+        is_read=False, categories=["Migrated", "ProjectX"],
+    )
+    _, kwargs = gc.posts[0]
+    gm = kwargs["json"]
+    assert gm["isRead"] is False  # type: ignore[index]
+    assert gm["categories"] == ["Migrated", "ProjectX"]  # type: ignore[index]
+    props = {p["id"]: p["value"] for p in gm["singleValueExtendedProperties"]}  # type: ignore[index]
+    assert props["Integer 0x0E07"] == "0"  # unread, still non-draft
+    assert "flag" not in gm  # not starred -> no follow-up flag
+
+
+def test_import_json_message_flagged_sets_followup_flag() -> None:
+    from migrator.microsoft.mail import import_json_message
+
+    gc = _RecordingGC()
+    import_json_message(gc, "u", "inbox", _simple_mime(), is_flagged=True)  # type: ignore[arg-type]
+    gm = gc.posts[0][1]["json"]
+    assert gm["flag"] == {"flagStatus": "flagged"}  # type: ignore[index]
+
+
+def test_patch_message_flags_includes_flag_and_categories() -> None:
+    from migrator.microsoft.mail import patch_message_flags
+
+    class _PatchGC:
+        def __init__(self) -> None:
+            self.body: dict[str, object] | None = None
+
+        def patch(self, path: str, user_key: str | None = None, **kwargs: object) -> None:
+            self.body = kwargs.get("json")  # type: ignore[assignment]
+
+    gc = _PatchGC()
+    patch_message_flags(gc, "u", "m1", is_read=False, categories=["Important"], is_flagged=True)  # type: ignore[arg-type]
+    assert gc.body == {
+        "isRead": False,
+        "categories": ["Important"],
+        "flag": {"flagStatus": "flagged"},
+    }
+
+
+def test_import_json_message_large_attachments_added_after_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from email.message import EmailMessage
+
+    from migrator.microsoft.mail import import_json_message
+
+    monkeypatch.setattr("migrator.microsoft.mail._MAX_INLINE_ATTACH_TOTAL", 4)
+    m = EmailMessage()
+    m["Subject"] = "S"
+    m["To"] = "b@y.com"
+    m.set_content("body")
+    m.add_attachment(b"BIGDATA", maintype="application", subtype="octet-stream", filename="f.bin")
+
+    gc = _RecordingGC()
+    dest = import_json_message(gc, "u", "inbox", m.as_bytes())  # type: ignore[arg-type]
+    assert dest == "id-1"
+    create_path, create_kwargs = gc.posts[0]
+    assert "attachments" not in create_kwargs["json"]  # type: ignore[operator]
+    attach_path, attach_kwargs = gc.posts[1]
+    assert attach_path == "/users/u/messages/id-1/attachments"
+    assert base64.b64decode(attach_kwargs["json"]["contentBytes"]) == b"BIGDATA"  # type: ignore[index]
+
+
+def test_import_message_dispatches_on_mode() -> None:
+    from migrator.microsoft.mail import import_message
+
+    json_gc = _RecordingGC()
+    import_message(json_gc, "u", "inbox", _simple_mime(), mode="json")  # type: ignore[arg-type]
+    assert "json" in json_gc.posts[0][1]
+
+    mime_gc = _RecordingGC()
+    import_message(mime_gc, "u", "inbox", _simple_mime(), mode="mime")  # type: ignore[arg-type]
+    assert "content" in mime_gc.posts[0][1]  # raw base64 MIME post
+
+
+def test_received_date_preferred_over_date_header() -> None:
+    from email import message_from_bytes, policy
+
+    from migrator.microsoft.mail import _extended_properties
+
+    raw = (
+        b"Received: from mx.example (mx.example) by mail.example; "
+        b"Wed, 10 Dec 2025 08:00:00 +0000\r\n"
+        b"From: a@x.com\r\n"
+        b"Date: Tue, 09 Dec 2025 13:42:55 +0000\r\n"
+        b"Subject: hi\r\n\r\nbody\r\n"
+    )
+    msg = message_from_bytes(raw, policy=policy.default)
+    props = {p["id"]: p["value"] for p in _extended_properties(
+        msg, raw, is_read=True, include_headers=False
+    )}
+    assert props["SystemTime 0x0039"] == "2025-12-09T13:42:55Z"  # sent = Date header
+    assert props["SystemTime 0x0E06"] == "2025-12-10T08:00:00Z"  # received = Received hop
+
+
+# ── attached emails (message/rfc822) ─────────────────────────────────────────
+
+
+def _forward_with_attached_message() -> bytes:
+    from email.message import EmailMessage
+
+    inner = EmailMessage()
+    inner["From"] = "ceo@corp.example"
+    inner["Subject"] = "CONFIDENTIAL plan"
+    inner.set_content("Inner body: do not forward.")
+
+    outer = EmailMessage()
+    outer["From"] = "me@corp.example"
+    outer["Subject"] = "FYI"
+    outer.set_content("Outer body: see attached.")
+    outer.add_attachment(inner, filename="original.eml")  # message/rfc822, attachment
+    return outer.as_bytes()
+
+
+def test_json_body_keeps_attached_message_as_eml() -> None:
+    import email
+    from email import policy
+
+    from migrator.microsoft.mail import _graph_body_and_attachments
+
+    msg = email.message_from_bytes(_forward_with_attached_message(), policy=policy.default)
+    body, attachments = _graph_body_and_attachments(msg)
+    # The inner body must not be spliced into ours...
+    assert body["content"].strip() == "Outer body: see attached."
+    # ...it travels as an .eml file attachment instead.
+    assert [a["name"] for a in attachments] == ["original.eml"]
+    assert attachments[0]["contentType"] == "message/rfc822"
+    eml = base64.b64decode(attachments[0]["contentBytes"])
+    assert b"CONFIDENTIAL plan" in eml and b"do not forward" in eml
+
+
+def test_split_large_attachments_extracts_attached_message_whole() -> None:
+    from migrator.microsoft.mail import _split_large_attachments
+
+    stripped, attachments = _split_large_attachments(_forward_with_attached_message())
+    assert [(name, ctype) for name, ctype, _ in attachments] == [("original.eml", "message/rfc822")]
+    assert b"CONFIDENTIAL plan" not in stripped
+    assert b"Outer body" in stripped
+
+
+def test_split_large_attachments_leaves_inline_forward_alone() -> None:
+    from email.message import EmailMessage
+
+    from migrator.microsoft.mail import _split_large_attachments
+
+    inner = EmailMessage()
+    inner["Subject"] = "quoted"
+    inner.set_content("inner")
+    outer = EmailMessage()
+    outer["Subject"] = "Fwd"
+    outer.set_content("outer")
+    outer.add_attachment(inner, disposition="inline")  # inline forward, not an attachment
+
+    stripped, attachments = _split_large_attachments(outer.as_bytes())
+    assert attachments == []
+    assert b"inner" in stripped  # kept in place, not descended into

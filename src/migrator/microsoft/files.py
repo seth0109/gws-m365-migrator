@@ -72,25 +72,49 @@ def ensure_folder(
     parent_id: str | None,
     folder_name: str,
 ) -> str:
-    """Create folder if absent, return its driveItem ID."""
+    """Create folder if absent, return its driveItem ID.
+
+    Children are listed with pagination and matched client-side: Graph's
+    /children endpoint does not support $filter at all, and driveItem names are
+    case-insensitively unique. On a 409 (nameAlreadyExists — a paging miss or a
+    concurrent create) the folder is re-resolved instead of failing."""
     if parent_id:
         path = f"/{drive_root}/items/{parent_id}/children"
     else:
         path = f"/{drive_root}/root/children"
 
-    flt = {"$filter": f"name eq '{folder_name}' and folder ne null"}
-    existing = gc.get(path, user_key=user_key, params=flt)
-    for item in existing.get("value", []):
-        if item["name"] == folder_name:
-            return str(item["id"])
+    existing = _find_child_folder(gc, path, user_key, folder_name)
+    if existing:
+        return existing
 
     body = {
         "name": folder_name,
         "folder": {},
         "@microsoft.graph.conflictBehavior": "fail",
     }
-    result = gc.post(path, user_key=user_key, json=body)
-    return str(result["id"])
+    try:
+        result = gc.post(path, user_key=user_key, json=body)
+        return str(result["id"])
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 409:
+            raise
+        resolved = _find_child_folder(gc, path, user_key, folder_name)
+        if resolved:
+            return resolved
+        raise
+
+
+def _find_child_folder(
+    gc: GraphClient, path: str, user_key: str, folder_name: str
+) -> str | None:
+    target = folder_name.casefold()
+    for page in gc.paginate(
+        path, user_key=user_key, params={"$top": 200, "$select": "id,name,folder"}
+    ):
+        for item in page:
+            if "folder" in item and str(item.get("name", "")).casefold() == target:
+                return str(item["id"])
+    return None
 
 
 def upload_small_file(
@@ -101,10 +125,11 @@ def upload_small_file(
     file_name: str,
     content: bytes,
 ) -> str:
-    result = gc.post(
-        f"/{drive_root}/items/{parent_id}:/{file_name}:/content",
+    # Simple upload is PUT-only (docs: driveitem-put-content); POST returns 405.
+    result = gc.put_raw(
+        f"{GRAPH_BASE}/{drive_root}/items/{parent_id}:/{file_name}:/content",
+        data=content,
         user_key=user_key,
-        content=content,
         headers={"Content-Type": "application/octet-stream"},
     )
     return str(result["id"])

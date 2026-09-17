@@ -438,7 +438,7 @@ def test_shared_drives_delta_persists_and_reads_cursor(
     init_db(tmp_path / "state.db")
     monkeypatch.setattr(
         files_job, "ensure_site_for_drive",
-        lambda gc, drive_id, alias, display: ("site-1", "lib-drive-1"),
+        lambda gc, drive_id, alias, display, owner=None: ("site-1", "lib-drive-1"),
     )
 
     cfg = Config.model_validate({

@@ -4,17 +4,32 @@ import logging
 import time
 from typing import Any
 
+import httpx
 from sqlalchemy.orm import Session
 
 from ..state.db import get_folder_dest, session_scope, upsert_folder
-from .graph_client import GraphClient
+from .graph_client import GRAPH_BASE, GraphClient
 
 log = logging.getLogger(__name__)
+
+# mailNickname allows ASCII 0-127 except these (per POST /groups docs), max 64.
+_NICKNAME_ILLEGAL = set('@()\\[]";:<>, ')
+
+
+def _sanitize_mail_nickname(alias: str) -> str:
+    cleaned = "".join(
+        c if ord(c) < 128 and c not in _NICKNAME_ILLEGAL else "-" for c in alias
+    )
+    cleaned = cleaned.strip("-.") or "site"
+    return cleaned[:64]
 
 # State namespace for the (shared drive → SharePoint site/drive) mapping. Keeps
 # auto-provisioning idempotent: a re-run reuses the site created on the first run.
 _STATE_USER = "__shared_drives__"
 _STATE_WORKLOAD = "sharepoint_site"
+# Group created but its site not yet resolved: lets a re-run resume polling
+# instead of POSTing a second group with the same mailNickname (which 400s).
+_GROUP_WORKLOAD = "sharepoint_group"
 
 _PROVISION_POLL_ATTEMPTS = 30
 _PROVISION_POLL_SECONDS = 10
@@ -25,6 +40,7 @@ def ensure_site_for_drive(
     drive_id: str,
     alias: str,
     display_name: str,
+    owner: str | None = None,
 ) -> tuple[str, str]:
     """Return (site_id, document_library_drive_id) for a shared drive, creating a
     connected SharePoint team site if one was not already provisioned.
@@ -32,6 +48,11 @@ def ensure_site_for_drive(
     Idempotent via FolderMap (dest_id = SharePoint drive id, dest_path = site id),
     so re-runs reuse the existing site. Requires the destination app to hold
     Group.ReadWrite.All and Sites.ReadWrite.All (or Sites.FullControl.All).
+
+    `owner` (UPN or user object id) is bound as the group owner: Graph documents
+    that a group created app-only *without* owners may never get its SharePoint
+    site provisioned. Visibility is Private — migrated drives must not default
+    to org-wide visibility.
     """
     with session_scope() as s:
         existing_drive = get_folder_dest(s, _STATE_USER, _STATE_WORKLOAD, drive_id)
@@ -40,19 +61,38 @@ def ensure_site_for_drive(
             if site_row:
                 log.info("Reusing SharePoint site for shared drive %s", drive_id)
                 return site_row, existing_drive
+        pending_group = get_folder_dest(s, _STATE_USER, _GROUP_WORKLOAD, drive_id)
 
-    group = gc.post(
-        "/groups",
-        json={
+    if pending_group:
+        log.info(
+            "Resuming site provisioning for shared drive %s (group %s)", drive_id, pending_group
+        )
+        group_id = pending_group
+    else:
+        body: dict[str, Any] = {
             "displayName": display_name,
-            "mailNickname": alias,
+            "mailNickname": _sanitize_mail_nickname(alias),
             "groupTypes": ["Unified"],
             "mailEnabled": True,
             "securityEnabled": False,
-        },
-    )
-    group_id = group["id"]
-    log.info("Created M365 group %s (%s) for shared drive %s", display_name, group_id, drive_id)
+            "visibility": "Private",
+        }
+        if owner:
+            body["owners@odata.bind"] = [f"{GRAPH_BASE}/users/{owner}"]
+        else:
+            log.warning(
+                "Provisioning group %s app-only without an owner — the SharePoint "
+                "site may never provision (set destination.sharepoint_site_owner)",
+                display_name,
+            )
+        group = gc.post("/groups", json=body)
+        group_id = str(group["id"])
+        # Record the group *before* polling so a timeout leaves a resumable trail.
+        with session_scope() as s:
+            upsert_folder(s, _STATE_USER, _GROUP_WORKLOAD, drive_id, group_id, alias)
+        log.info(
+            "Created M365 group %s (%s) for shared drive %s", display_name, group_id, drive_id
+        )
 
     site = _poll_group_site(gc, group_id)
     site_id = site["id"]
@@ -83,12 +123,18 @@ def _poll_group_site(gc: GraphClient, group_id: str) -> dict[str, Any]:
                 f"/groups/{group_id}/sites/root", params={"$select": "id,webUrl"}
             )
             return site
-        except Exception as exc:  # noqa: BLE001 - site not ready yet (404/503)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in (404, 503):
+                # Permanent failure (403 permissions, bad request, ...): waiting
+                # through the whole poll window won't fix it — surface it now.
+                raise
             last_exc = exc
             log.info("Waiting for site provisioning (attempt %d)…", attempt + 1)
             time.sleep(_PROVISION_POLL_SECONDS)
     raise RuntimeError(
-        f"SharePoint site for group {group_id} was not provisioned in time"
+        f"SharePoint site for group {group_id} was not provisioned in time. "
+        "If the group was created without an owner, set "
+        "destination.sharepoint_site_owner and re-run."
     ) from last_exc
 
 

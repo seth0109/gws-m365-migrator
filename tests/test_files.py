@@ -1,15 +1,27 @@
-"""Tests for OneDrive provisioning handling in the files writer.
+"""Tests for the OneDrive/SharePoint files writer.
 
-A destination user's OneDrive is created lazily, so /users/{id}/drive 404s with
-"User's mysite not found" until it comes online. ensure_onedrive must trigger +
-wait for provisioning and fail with a clear error if it never appears.
+Provisioning: a destination user's OneDrive is created lazily, so
+/users/{id}/drive 404s with "User's mysite not found" until it comes online.
+ensure_onedrive must trigger + wait for provisioning and fail clearly.
+
+Folders: Graph's /children endpoint does not support $filter, so ensure_folder
+must paginate and match client-side (case-insensitively) and recover from a 409
+nameAlreadyExists. Simple upload must be PUT (POST is 405 per Graph docs).
 """
 from __future__ import annotations
+
+from collections.abc import Iterator
+from typing import Any
 
 import httpx
 import pytest
 
-from migrator.microsoft.files import _is_mysite_missing, ensure_onedrive
+from migrator.microsoft.files import (
+    _is_mysite_missing,
+    ensure_folder,
+    ensure_onedrive,
+    upload_small_file,
+)
 
 
 def _resp(code: int, text: str = "") -> httpx.Response:
@@ -76,3 +88,89 @@ def test_ensure_onedrive_reraises_unrelated_errors() -> None:
 
     with pytest.raises(httpx.HTTPStatusError):
         ensure_onedrive(_BadGC(), "user-id")  # type: ignore[arg-type]
+
+
+class _DriveGC:
+    """Fake GraphClient for folder/upload paths: paginated children listing,
+    optional 409 on create, and a recording put_raw."""
+
+    def __init__(
+        self,
+        pages: list[list[dict[str, Any]]],
+        post_error: Exception | None = None,
+        pages_after_conflict: list[list[dict[str, Any]]] | None = None,
+    ) -> None:
+        self._pages = pages
+        self._post_error = post_error
+        self._pages_after_conflict = pages_after_conflict
+        self.paginate_calls = 0
+        self.post_calls = 0
+        self.put_calls: list[tuple[str, bytes]] = []
+
+    def paginate(self, path: str, **kwargs: Any) -> Iterator[list[dict[str, Any]]]:
+        self.paginate_calls += 1
+        if self.paginate_calls > 1 and self._pages_after_conflict is not None:
+            yield from self._pages_after_conflict
+        else:
+            yield from self._pages
+
+    def post(self, path: str, **kwargs: Any) -> dict[str, Any]:
+        self.post_calls += 1
+        if self._post_error is not None:
+            raise self._post_error
+        return {"id": "created-id"}
+
+    def put_raw(self, url: str, data: bytes, **kwargs: Any) -> dict[str, Any]:
+        self.put_calls.append((url, data))
+        return {"id": "uploaded-id"}
+
+
+def test_ensure_folder_finds_existing_beyond_first_page_case_insensitive() -> None:
+    gc = _DriveGC(
+        pages=[
+            [{"id": "f1", "name": "Other", "folder": {}}],
+            [{"id": "f2", "name": "REPORTS", "folder": {}}],
+        ]
+    )
+    got = ensure_folder(gc, "users/u/drive", "u", None, "Reports")  # type: ignore[arg-type]
+    assert got == "f2"
+    assert gc.post_calls == 0
+
+
+def test_ensure_folder_ignores_file_with_same_name() -> None:
+    gc = _DriveGC(pages=[[{"id": "x1", "name": "Reports", "file": {}}]])
+    got = ensure_folder(gc, "users/u/drive", "u", None, "Reports")  # type: ignore[arg-type]
+    assert got == "created-id"
+    assert gc.post_calls == 1
+
+
+def test_ensure_folder_creates_when_absent() -> None:
+    gc = _DriveGC(pages=[[]])
+    got = ensure_folder(gc, "users/u/drive", "u", "parent1", "New Folder")  # type: ignore[arg-type]
+    assert got == "created-id"
+
+
+def test_ensure_folder_recovers_from_409_by_relisting() -> None:
+    gc = _DriveGC(
+        pages=[[]],
+        post_error=_status_error(409, '{"error":{"code":"nameAlreadyExists"}}'),
+        pages_after_conflict=[[{"id": "raced", "name": "Reports", "folder": {}}]],
+    )
+    got = ensure_folder(gc, "users/u/drive", "u", None, "Reports")  # type: ignore[arg-type]
+    assert got == "raced"
+
+
+def test_ensure_folder_reraises_non_409() -> None:
+    gc = _DriveGC(pages=[[]], post_error=_status_error(403, "Forbidden"))
+    with pytest.raises(httpx.HTTPStatusError):
+        ensure_folder(gc, "users/u/drive", "u", None, "Reports")  # type: ignore[arg-type]
+
+
+def test_upload_small_file_uses_put() -> None:
+    gc = _DriveGC(pages=[[]])
+    got = upload_small_file(gc, "users/u/drive", "u", "p1", "a.txt", b"data")  # type: ignore[arg-type]
+    assert got == "uploaded-id"
+    assert len(gc.put_calls) == 1
+    url, data = gc.put_calls[0]
+    assert url.endswith("/users/u/drive/items/p1:/a.txt:/content")
+    assert data == b"data"

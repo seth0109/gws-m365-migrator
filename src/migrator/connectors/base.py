@@ -32,6 +32,10 @@ class SourceMessage:
     size_bytes: int | str = ""
     date: str = ""
     sender: str = ""
+    # Set by the connector when the raw message could not be read from the
+    # source (transient error): the job fails just this item and holds the
+    # cursor instead of the whole mailbox run aborting mid-enumeration.
+    fetch_error: str = ""
 
 
 @dataclass
@@ -57,6 +61,14 @@ class SourceContact:
     source_id: str
     graph_body: dict[str, Any]  # ready for microsoft.contacts.create_contact
     folder_name: str = "Imported Contacts"
+    # Opaque connector-specific reference to the contact's photo (empty = none);
+    # resolved lazily via BaseSource.fetch_contact_photo().
+    photo_ref: str = ""
+    # Source-side change marker (People etag / Graph changeKey). A delta pass
+    # PATCHes an already-migrated contact whose hash changed.
+    source_hash: str = ""
+    # Tombstone from an incremental sync: delete the migrated copy instead.
+    is_deleted: bool = False
     # Inventory metadata:
     display_name: str = ""
     primary_email: str = ""
@@ -73,6 +85,14 @@ class SourceEvent:
     source_id: str
     graph_body: dict[str, Any]  # ready for microsoft.calendar.create_event
     is_cancelled: bool = False
+    # Set for a modified/cancelled single occurrence of a recurring series: the
+    # series master's source id plus the occurrence's original start (full ISO
+    # with offset, or bare "YYYY-MM-DD" for all-day). The calendar job applies
+    # these onto the migrated series instead of creating standalone events.
+    master_source_id: str = ""
+    original_start: str = ""
+    # Source-side change marker (Calendar etag / Graph changeKey); see SourceContact.
+    source_hash: str = ""
     # Inventory metadata:
     subject: str = ""
     modified_time: str = ""
@@ -163,6 +183,11 @@ class BaseSource:
 
     def inventory_contacts(self, user: UserMapping) -> Iterator[SourceContact]:
         raise NotImplementedError
+
+    def fetch_contact_photo(self, user: UserMapping, contact: SourceContact) -> bytes | None:
+        """Resolve `contact.photo_ref` to image bytes, or None. Best-effort —
+        photo fidelity must never fail a contact migration. Default: no photos."""
+        return None
 
     # -- calendar ----------------------------------------------------------- #
     def list_calendars(self, user: UserMapping) -> list[CalendarRef]:

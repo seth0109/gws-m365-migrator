@@ -7,6 +7,7 @@ from typing import Any
 from ..auth.google_auth import build_service
 from ..config import GoogleConfig
 from ..ratelimit import registry
+from . import NUM_RETRIES
 
 log = logging.getLogger(__name__)
 
@@ -47,7 +48,7 @@ def iter_my_drive_files(
             registry.acquire("google_global")
         except KeyError:
             pass
-        resp = svc.files().list(**params).execute()
+        resp = svc.files().list(**params).execute(num_retries=NUM_RETRIES)
         for f in resp.get("files", []):
             yield f
         next_token = resp.get("nextPageToken")
@@ -76,7 +77,7 @@ def iter_shared_drive_files(
             registry.acquire("google_global")
         except KeyError:
             pass
-        resp = svc.files().list(**params).execute()
+        resp = svc.files().list(**params).execute(num_retries=NUM_RETRIES)
         for f in resp.get("files", []):
             yield f
         next_token = resp.get("nextPageToken")
@@ -97,7 +98,7 @@ def list_shared_drives(cfg: GoogleConfig, user_email: str) -> list[dict[str, Any
             registry.acquire("google_global")
         except KeyError:
             pass
-        resp = svc.drives().list(**params).execute()
+        resp = svc.drives().list(**params).execute(num_retries=NUM_RETRIES)
         drives.extend(resp.get("drives", []))
         page_token = resp.get("nextPageToken")
         if not page_token:
@@ -108,7 +109,7 @@ def list_shared_drives(cfg: GoogleConfig, user_email: str) -> list[dict[str, Any
 def download_file(cfg: GoogleConfig, user_email: str, file_id: str) -> bytes:
     svc = _svc(cfg, user_email)
     request = svc.files().get_media(fileId=file_id, supportsAllDrives=True)
-    return request.execute()
+    return request.execute(num_retries=NUM_RETRIES)
 
 
 def export_native_file(
@@ -116,7 +117,7 @@ def export_native_file(
 ) -> bytes:
     svc = _svc(cfg, user_email)
     request = svc.files().export_media(fileId=file_id, mimeType=export_mime)
-    return request.execute()
+    return request.execute(num_retries=NUM_RETRIES)
 
 
 def get_changes_start_token(
@@ -128,7 +129,7 @@ def get_changes_start_token(
     params: dict[str, Any] = {}
     if drive_id:
         params = {"driveId": drive_id, "supportsAllDrives": True}
-    resp = svc.changes().getStartPageToken(**params).execute()
+    resp = svc.changes().getStartPageToken(**params).execute(num_retries=NUM_RETRIES)
     return resp["startPageToken"]
 
 
@@ -161,7 +162,11 @@ def iter_drive_changes(
             registry.acquire("google_global")
         except KeyError:
             pass
-        resp = svc.changes().list(pageToken=current_token, **list_params).execute()
+        resp = (
+            svc.changes()
+            .list(pageToken=current_token, **list_params)
+            .execute(num_retries=NUM_RETRIES)
+        )
 
         for change in resp.get("changes", []):
             if change.get("type") != "file" or change.get("removed"):
