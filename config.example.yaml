@@ -1,54 +1,121 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# Migration config. Pick ONE `source:` block (delete the others). The `destination:`
-# is always Microsoft 365. See the three source examples at the bottom of this file.
-# ─────────────────────────────────────────────────────────────────────────────
-state_db: migration_state.db
-log_level: INFO
-log_file: migrator.log
+# =============================================================================
+# gws-m365-migrator - configuration template
+#
+#   cp config.example.yaml config.yaml      (or let `migrator init-config` write it)
+#
+# Every field the tool understands is listed here with its default. Values shown
+# are placeholders; nothing in this file is a real tenant, key, or address.
+# Keep the real config.yaml and everything under credentials/ out of git - both
+# are already in .gitignore.
+#
+# Pick exactly ONE `source:` block. The Google block is active below; the IMAP
+# and Microsoft 365 blocks are commented alternatives. The destination is
+# always Microsoft 365.
+# =============================================================================
 
-# ── SOURCE (choose one type) ────────────────────────────────────────────────
+# -- General ------------------------------------------------------------------
+state_db: migration_state.db     # SQLite state (id maps, cursors, job log). Never delete between runs.
+log_level: INFO                  # DEBUG | INFO | WARNING | ERROR
+log_file: migrator.log           # set to null to log to the console only
+
+# -- SOURCE -------------------------------------------------------------------
+# * Option 1: Google Workspace (mail, files, contacts, calendar, shared drives)
 source:
   type: google_workspace
+  # Service-account JSON key. The account needs domain-wide delegation granted
+  # for the scopes below.
   service_account_key_file: credentials/google-service-account.json
+  # Workspace admin to impersonate for tenant-level work (Shared Drives).
   admin_email: admin@yourdomain.com
-  # Read-only scopes — the tool never writes to Google.
+  # Optional. Defaults to these four. Every scope MUST end in `.readonly`; the
+  # tool refuses to start otherwise - it never writes to Google.
   scopes:
     - https://www.googleapis.com/auth/gmail.readonly
     - https://www.googleapis.com/auth/drive.readonly
     - https://www.googleapis.com/auth/contacts.readonly
     - https://www.googleapis.com/auth/calendar.readonly
 
-# ── DESTINATION (Microsoft 365) ─────────────────────────────────────────────
+# * Option 2: IMAP (mail only - any IMAP server)
+# source:
+#   type: imap
+#   host: imap.old.example
+#   port: 993                        # default 993
+#   use_ssl: true                    # default true; false for plain IMAP (usually port 143)
+#   # Folders to skip entirely, by the exact name the server lists (optional).
+#   exclude_folders: ["Public Folders", "Calendar"]
+# Per-mailbox IMAP credentials live on each `users[]` entry - see below.
+
+# * Option 3: Microsoft 365 -> Microsoft 365 (tenant-to-tenant)
+# source:
+#   type: microsoft365
+#   tenant_id: "11111111-1111-1111-1111-111111111111"     # SOURCE tenant
+#   client_id: "11111111-1111-1111-1111-111111111111"     # app registered in the source tenant
+#   # Certificate auth (preferred): PEM private key + SHA-1 thumbprint of the
+#   # certificate uploaded to the source app registration...
+#   certificate_path: credentials/source-ms-key.pem
+#   certificate_thumbprint: "112233445566778899AABBCCDDEEFF0011223344"
+#   # ...or a client secret instead of the two certificate fields.
+#   # client_secret: "SOURCE-APP-SECRET"
+#   token_cache_file: .ms_source_token_cache.json          # default
+
+# -- DESTINATION (always Microsoft 365) ---------------------------------------
 destination:
   type: microsoft365
   tenant_id: "00000000-0000-0000-0000-000000000000"
   client_id: "00000000-0000-0000-0000-000000000000"
-  # Certificate (preferred) or client secret.
-  certificate_path: credentials/ms-cert.pem
-  certificate_thumbprint: "AABBCCDDEEFF..."
-  # client_secret: "optional-if-not-using-cert"
-  token_cache_file: .ms_token_cache.json
-  # Owner for auto-provisioned SharePoint sites (shared-drives / sharepoint
-  # commands). Effectively required: app-only groups created without an owner
-  # may never get their site provisioned.
-  # sharepoint_site_owner: admin@yourdomain.com
+  # Certificate auth (preferred): PEM PRIVATE KEY file + SHA-1 thumbprint (no
+  # colons) of the certificate uploaded to the app registration.
+  certificate_path: credentials/ms-key.pem
+  certificate_thumbprint: "AABBCCDDEEFF00112233445566778899AABBCCDD"
+  # Or a client secret instead of the two certificate fields:
+  # client_secret: "DEST-APP-SECRET"
+  token_cache_file: .ms_token_cache.json   # default
+  # Owner (UPN or object id) for SharePoint sites the tool provisions
+  # (`shared-drives` / `sharepoint`). Effectively required for those commands:
+  # a group created app-only without an owner may never get its site.
+  # sharepoint_site_owner: admin@yourtenant.onmicrosoft.com
 
-# ── USER MAPPINGS (source identity → destination UPN) ───────────────────────
+# -- USERS (source identity -> destination UPN) --------------------------------
+# `migrator init-config -m users.csv` fills this from a CSV (see users.example.csv).
 users:
-  - source_id: alice@yourdomain.com
-    dest_id: alice@yourtenant.onmicrosoft.com
+  - source_id: alice@yourdomain.com            # Google email / IMAP address / source-tenant UPN
+    dest_id: alice@yourtenant.onmicrosoft.com  # destination mailbox UPN
   - source_id: bob@yourdomain.com
     dest_id: bob@yourtenant.onmicrosoft.com
+  # IMAP source only - per-user login. Omit imap_user when it equals source_id.
+  # Prefer imap_password_env (name of an environment variable holding the
+  # password) so no secret is stored in this file; imap_password is inline and
+  # meant for throwaway test accounts only.
+  # - source_id: carol@old.example
+  #   dest_id: carol@yourtenant.onmicrosoft.com
+  #   imap_user: carol
+  #   imap_password_env: CAROL_IMAP_PW
+  #   # imap_password: "plain-text-fallback"
 
-# ── SHARED DRIVES → SHAREPOINT (google_workspace source only) ───────────────
-# Used by `migrator shared-drives`. Each drive auto-provisions a SharePoint site.
+# -- SHARED DRIVES -> SHAREPOINT (google_workspace source; `migrator shared-drives`) -
+# Identify each drive by name OR id. A private team site is provisioned per
+# drive (mailNickname = target_site_alias) and reused on re-runs.
 shared_drives:
   - drive_name: "Marketing"
-    target_site_alias: "marketing"        # mailNickname for the provisioned site
-    display_name: "Marketing (migrated)"  # optional; defaults to drive_name
+    target_site_alias: "marketing"
+    display_name: "Marketing (migrated)"    # optional; defaults to drive_name
   # - drive_id: "0AKxxxxxxxxxxxxUk9PVA"
   #   target_site_alias: "engineering"
 
+# -- SHAREPOINT SITES (microsoft365 source; `migrator sharepoint`) ------------
+# Each source site goes to an EXISTING destination site (dest_site) OR a site
+# provisioned from target_site_alias - give exactly one of the two. Site
+# addresses are a site id or "host:/sites/Name".
+# sharepoint_sites:
+#   - source_site: "contoso.sharepoint.com:/sites/Marketing"
+#     dest_site: "fabrikam.sharepoint.com:/sites/Marketing"
+#   - source_site: "contoso.sharepoint.com:/sites/Engineering"
+#     target_site_alias: "engineering"
+#     display_name: "Engineering"           # optional; defaults to the alias
+
+# -- WORKLOADS ----------------------------------------------------------------
+# Each workload can be disabled and has its own thread-pool size (users
+# processed in parallel). Workloads the source cannot do are skipped anyway.
 workloads:
   contacts:
     enabled: true
@@ -59,58 +126,24 @@ workloads:
   files:
     enabled: true
     concurrency: 2
-    chunk_size_bytes: 10485760  # 10 MB
+    chunk_size_bytes: 10485760      # 10 MB upload-session chunks
   mail:
     enabled: true
     concurrency: 2
-    # "categories" (default) or "duplicate"
+    # Gmail only. A message with several user labels: "categories" files it in
+    # the first label's folder and adds the rest as Outlook categories;
+    # "duplicate" copies it into every label's folder.
     multi_label_policy: categories
-    # "json" (default): messages arrive as normal non-draft mail with original
-    # sent/received dates (MAPI extended properties). "mime": byte-perfect MIME
-    # import, but Graph creates every message as a draft dated at import time.
+    # "json" (default): messages arrive as normal, non-draft mail with their
+    # original sent/received dates. "mime": byte-perfect MIME import, but Graph
+    # creates every message as a draft dated at import time.
     import_mode: json
-    # Migrate Gmail Spam/Trash too (→ JunkEmail / DeletedItems). Default true.
+    # Gmail only. Migrate Spam/Trash too (-> Junk Email / Deleted Items).
     include_spam_trash: true
 
+# -- RATE LIMITS --------------------------------------------------------------
+# Token buckets shared by all threads. Lower these if either side throttles.
 rate_limits:
   google_requests_per_second: 10
   graph_requests_per_second: 4
   graph_requests_per_mailbox_per_minute: 120
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ALTERNATIVE SOURCE BLOCKS — replace the `source:` above with one of these.
-#
-# 1) IMAP / generic SMTP server (mail workload only). Per-user credentials live
-#    on each user mapping; prefer imap_password_env (reads from an env var).
-#
-#    source:
-#      type: imap
-#      host: imap.example.com
-#      port: 993
-#      use_ssl: true
-#      exclude_folders: ["Public Folders"]   # optional
-#    users:
-#      - source_id: alice@old.com
-#        dest_id: alice@yourtenant.onmicrosoft.com
-#        imap_user: alice@old.com
-#        imap_password_env: ALICE_IMAP_PW     # export ALICE_IMAP_PW=... before running
-#
-# 2) Microsoft 365 → Microsoft 365 (tenant-to-tenant). Source is the OTHER tenant.
-#    source_id / dest_id are the source-tenant and destination-tenant UPNs.
-#
-#    source:
-#      type: microsoft365
-#      tenant_id: "11111111-1111-1111-1111-111111111111"
-#      client_id: "11111111-1111-1111-1111-111111111111"
-#      certificate_path: credentials/source-ms-cert.pem
-#      certificate_thumbprint: "112233445566..."
-#      token_cache_file: .ms_source_token_cache.json
-#
-#    # SharePoint site → site (microsoft365 source only); used by `migrator sharepoint`.
-#    # Give each source site a dest_site (existing) OR target_site_alias (auto-provision).
-#    sharepoint_sites:
-#      - source_site: "contoso.sharepoint.com:/sites/Marketing"
-#        dest_site:   "fabrikam.sharepoint.com:/sites/Marketing"   # existing dest site
-#      - source_site: "contoso.sharepoint.com:/sites/Engineering"
-#        target_site_alias: "engineering"                          # auto-provision dest site
-# ─────────────────────────────────────────────────────────────────────────────

@@ -175,6 +175,9 @@ class Config(BaseModel):
 
 
 def load_config(path: Path) -> Config:
-    with open(path) as f:
+    # YAML is UTF-8 by spec. Without an explicit encoding, Windows opens the file
+    # as cp1252 and either garbles non-ASCII values (display names, comments) or
+    # raises on bytes cp1252 cannot decode.
+    with open(path, encoding="utf-8") as f:
         raw = yaml.safe_load(f)
     return Config.model_validate(raw)

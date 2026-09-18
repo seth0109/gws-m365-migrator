@@ -388,7 +388,7 @@ def init_config(
         console.print(f"[red]{exc}")
         raise typer.Exit(1) from exc
 
-    output.write_text(dump_config_yaml(cfg))
+    output.write_text(dump_config_yaml(cfg), encoding="utf-8")  # load_config reads UTF-8
     console.print(
         f"[green]Wrote {output} — source '{source_type}', {len(users)} user mapping(s)."
     )

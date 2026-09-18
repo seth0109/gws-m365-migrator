@@ -12,9 +12,18 @@ config.yaml
 *.token
 token.json
 
+# Environment files holding IMAP passwords etc.
+.env
+.env.*
+# Real user-mapping CSV (addresses); keep users.example.csv tracked
+users.csv
+
 # --- Project state & logs ---
 migration_state.db
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.sqlite
 *.sqlite3
 migrator.log
