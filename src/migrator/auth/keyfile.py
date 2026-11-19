@@ -28,6 +28,30 @@ class KeyFileError(ValueError):
     """`certificate_path` does not hold a usable PEM RSA private key."""
 
 
+def _is_private_key_file(path: Path) -> bool:
+    try:
+        if not path.is_file() or path.stat().st_size > 64 * 1024:
+            return False
+        labels = _PEM_LABEL.findall(path.read_bytes())
+    except OSError:
+        return False
+    return any(lb.endswith(b"PRIVATE KEY") and not lb.startswith(b"OPENSSH") for lb in labels)
+
+
+def _keys_nearby(path: Path) -> str:
+    """A sentence naming the PEM private keys in `path`'s folder — when the
+    configured file is missing or is the certificate, one of these is usually
+    the file that was meant."""
+    folder = path.parent
+    try:
+        keys = sorted(p.name for p in folder.iterdir() if p != path and _is_private_key_file(p))
+    except OSError:
+        return f" The folder '{folder.resolve()}' does not exist or cannot be read."
+    if not keys:
+        return f" There is no PEM private key in '{folder.resolve()}'."
+    return f" PEM private keys in '{folder}': {', '.join(keys)}."
+
+
 def _describe(data: bytes) -> str:
     """Why `data` is not a PEM private key, and what to do about it."""
     if not data.strip():
@@ -59,10 +83,22 @@ def _describe(data: bytes) -> str:
 def read_private_key(path: Path) -> bytes:
     """Return the PEM bytes of the RSA private key at `path`.
 
-    Raises KeyFileError naming the file and what it actually contains. A PEM
-    that carries the certificate alongside the key is fine. A missing file is
-    left to raise its own FileNotFoundError."""
-    data = path.read_bytes()
+    Raises KeyFileError naming the file and what is wrong with it: missing
+    (with the absolute path that was tried), or what it actually contains —
+    plus the private keys that do sit in the same folder. A PEM that carries
+    the certificate alongside the key is fine."""
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError as exc:
+        raise KeyFileError(
+            f"certificate_path '{path}' does not exist: no file at {path.resolve()} "
+            "(a relative path is resolved from the directory migrator is run in, and "
+            f"names are case-sensitive on Linux).{_keys_nearby(path)}"
+        ) from exc
+    except OSError as exc:
+        raise KeyFileError(
+            f"certificate_path '{path}' cannot be read: {exc.strerror or exc}"
+        ) from exc
     try:
         key = load_pem_private_key(data, password=None)
     except TypeError as exc:  # "Password was not given but private key is encrypted"
@@ -71,7 +107,9 @@ def read_private_key(path: Path) -> bytes:
             "unencrypted copy with: openssl pkey -in <file> -out key.pem"
         ) from exc
     except (ValueError, UnsupportedAlgorithm) as exc:
-        raise KeyFileError(f"certificate_path '{path}' {_describe(data)}. {_NEED}.") from exc
+        raise KeyFileError(
+            f"certificate_path '{path}' {_describe(data)}. {_NEED}.{_keys_nearby(path)}"
+        ) from exc
     if not isinstance(key, RSAPrivateKey):
         raise KeyFileError(
             f"certificate_path '{path}' holds a non-RSA key ({type(key).__name__}); "

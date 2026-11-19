@@ -183,8 +183,6 @@ def check_key_files(creds: CredentialSet) -> None:
             read_private_key(path)
         except KeyFileError as exc:
             raise ConfigGenError(f"{exc} (pass {flag} to choose another file)") from exc
-        except OSError as exc:
-            raise ConfigGenError(f"Cannot read '{path}': {exc.strerror or exc}") from exc
 
 
 def parse_mapping_csv(path: Path) -> list[dict[str, str]]:

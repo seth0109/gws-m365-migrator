@@ -127,9 +127,43 @@ def test_unusable_key_file_is_named_and_described(tmp_path: Path, case: str) -> 
     assert phrase in message
 
 
-def test_missing_key_file_keeps_its_own_error(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError):
-        read_private_key(tmp_path / "nope.pem")
+def test_missing_key_file_says_where_it_looked_and_what_is_there(tmp_path: Path) -> None:
+    creds = tmp_path / "credentials"
+    creds.mkdir()
+    _write(creds, "ms-key-src.pem", _PKCS8)
+    _write(creds, "ms-key-dst.pem", _GOOD["pkcs1 RSA PRIVATE KEY"])
+    _write(creds, "ms-cert-src.crt", _CERT_PEM)          # not a key: must not be offered
+    _write(creds, "id_rsa", _BAD["openssh-format key"][0])  # unusable format: likewise
+    missing = creds / "ms-cert-src.pem"
+
+    with pytest.raises(KeyFileError) as err:
+        read_private_key(missing)
+    message = str(err.value)
+    assert message.startswith(f"certificate_path '{missing}' does not exist")
+    assert str(missing.resolve()) in message  # the absolute path that was tried
+    assert message.endswith(f"PEM private keys in '{creds}': ms-key-dst.pem, ms-key-src.pem.")
+
+
+def test_missing_key_file_in_a_missing_folder_points_at_the_folder(tmp_path: Path) -> None:
+    # The usual cause: migrator was run from a directory other than the one the
+    # config's relative paths were written for.
+    with pytest.raises(KeyFileError, match="does not exist or cannot be read"):
+        read_private_key(tmp_path / "credentials" / "ms-key.pem")
+
+
+def test_certificate_error_names_the_key_sitting_next_to_it(tmp_path: Path) -> None:
+    cert = _write(tmp_path, "ms-cert-src.pem", _CERT_PEM)
+    _write(tmp_path, "ms-key-src.pem", _PKCS8)
+    with pytest.raises(KeyFileError) as err:
+        read_private_key(cert)
+    assert "holds only the certificate" in str(err.value)
+    assert str(err.value).endswith(f"PEM private keys in '{tmp_path}': ms-key-src.pem.")
+
+
+def test_folder_without_any_key_says_so(tmp_path: Path) -> None:
+    cert = _write(tmp_path, "ms-cert-src.pem", _CERT_PEM)
+    with pytest.raises(KeyFileError, match="There is no PEM private key in"):
+        read_private_key(cert)
 
 
 # ── token provider: fail before MSAL, say which tenant block ─────────────────
@@ -221,6 +255,44 @@ def test_check_key_files_rejects_a_certificate_naming_the_flag(
     assert message.endswith(f"(pass {flag} to choose another file)")
 
 
-def test_check_key_files_reports_an_unreadable_path(tmp_path: Path) -> None:
-    with pytest.raises(ConfigGenError, match="Cannot read"):
+def test_check_key_files_reports_a_missing_path(tmp_path: Path) -> None:
+    with pytest.raises(ConfigGenError, match="does not exist"):
         check_key_files(CredentialSet(dest_cert=tmp_path / "missing.pem"))
+
+
+# ── smoke-test: a key-file mistake is one readable line, not a traceback ─────
+
+
+def test_smoke_test_prints_the_key_problem_without_a_traceback(tmp_path: Path) -> None:
+    import yaml
+    from typer.testing import CliRunner
+
+    from migrator.cli import app
+
+    creds = tmp_path / "credentials"
+    creds.mkdir()
+    _write(creds, "ms-key-src.pem", _PKCS8)
+    block = {"tenant_id": "t", "client_id": "c", "certificate_thumbprint": _TP}
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump({
+        "state_db": str(tmp_path / "state.db"),
+        "log_file": None,
+        "source": {
+            **block, "type": "microsoft365",
+            "certificate_path": str(creds / "ms-cert-src.pem"),  # no such file
+            "token_cache_file": str(tmp_path / "src-cache.json"),
+        },
+        "destination": {
+            **block, "cloud": "gcc_high",
+            "certificate_path": str(creds / "ms-key-src.pem"),
+            "token_cache_file": str(tmp_path / "dst-cache.json"),
+        },
+        "users": [{"source_id": "a@src", "dest_id": "a@dst"}],
+    }), encoding="utf-8")
+
+    result = CliRunner().invoke(app, ["smoke-test", "--config", str(config)])
+    assert result.exit_code == 1
+    text = " ".join(result.output.split())  # undo the console's line wrapping
+    assert "source.certificate_path" in text and "does not exist" in text
+    assert "ms-key-src.pem." in text  # the key that is there is offered
+    assert "Traceback" not in text and "Smoke test passed" not in text

@@ -3,14 +3,22 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
+import httpx
 import typer
 from rich.console import Console
 from rich.logging import RichHandler
 
-from .config import Config, UserMapping, load_config
+from .config import (
+    Config,
+    Microsoft365DestinationConfig,
+    Microsoft365SourceConfig,
+    UserMapping,
+    load_config,
+)
 from .connectors.factory import source_capabilities
+from .microsoft.graph_client import GraphClient
 from .orchestrator import JobFn, Orchestrator
 from .state.db import count_failed_items_since, session_scope
 
@@ -445,8 +453,27 @@ def smoke_test(
     kind = " (shared mailbox)" if pilot.mailbox_type == "shared" else ""
     console.print(f"[bold]Smoke test: pilot user = {pilot.source_id} → {pilot.dest_id}{kind}")
 
-    _probe_source(cfg, pilot)
-    _probe_destination(cfg, pilot)
+    from rich.markup import escape
+
+    from .auth.keyfile import KeyFileError
+    from .auth.ms_auth import TokenError
+
+    # What the smoke test exists to find — a wrong key file, a refused sign-in,
+    # a pilot account that is not there, a missing permission — is a finding,
+    # not a crash: print the line that says what to fix, not a traceback.
+    for side, probe in (("source", _probe_source), ("destination", _probe_destination)):
+        try:
+            probe(cfg, pilot)
+        except KeyFileError as exc:  # already names its tenant block
+            finding = str(exc)
+        except (TokenError, _SmokeFinding) as exc:
+            finding = f"{side}: {exc}"
+        except httpx.HTTPStatusError as exc:
+            finding = f"{side}: {_explain_graph_error(exc)}"
+        else:
+            continue
+        console.print(f"[red]{escape(finding)}")
+        raise typer.Exit(1)
 
     from .state.db import init_db, session_scope
     from .state.models import JobRun
@@ -483,23 +510,102 @@ def _probe_source(cfg: Config, pilot: UserMapping) -> None:
         finally:
             src.close()
     elif stype == "microsoft365":
+        from .config import Microsoft365SourceConfig
+
+        assert isinstance(cfg.source, Microsoft365SourceConfig)
         orch = Orchestrator(cfg)
         with orch.source_graph_client() as gc:
-            info = gc.get(f"/users/{pilot.source_id}", params={"$select": "id,displayName"})
+            info = _resolve_pilot(gc, pilot.source_id, "source_id", cfg.source)
             name = info.get("displayName", pilot.source_id)
             console.print(f"[green]M365 source OK — resolved {name}")
     else:
         console.print(f"[yellow]No source probe implemented for type '{stype}'")
 
 
+class _SmokeFinding(Exception):
+    """A problem the smoke test found; printed as one line, without a traceback."""
+
+
+def _resolve_pilot(
+    gc: GraphClient,
+    user_id: str,
+    field: str,
+    tenant: Microsoft365SourceConfig | Microsoft365DestinationConfig,
+) -> dict[str, Any]:
+    """GET /users/{id} for the pilot mapping. A 404 here is the commonest
+    first-run finding (the account is not in that tenant under that name), so it
+    is explained — with the sign-in names the tenant does have — not raised raw."""
+    try:
+        info: dict[str, Any] = gc.get(
+            f"/users/{user_id}",
+            params={"$select": "id,displayName,userPrincipalName"},
+            quiet_statuses=(404,),
+        )
+        return info
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 404:
+            raise
+        raise _SmokeFinding(
+            f"no user '{user_id}' in tenant {tenant.tenant_id} ({tenant.cloud} cloud, "
+            f"{gc.base_url}). users[].{field} must be the account's sign-in name "
+            "(userPrincipalName) or object id in that tenant — a mail alias does not "
+            "resolve — and the account must already exist: the tool does not create "
+            f"users or mailboxes.{_sign_in_name_hints(gc, user_id)}"
+        ) from exc
+
+
+def _sign_in_name_hints(gc: GraphClient, user_id: str) -> str:
+    """Sign-in names read from the tenant that may be the one that was meant."""
+
+    def names(**params: str) -> list[str]:
+        data = gc.get("/users", params={"$select": "userPrincipalName", "$top": "5", **params})
+        return [u["userPrincipalName"] for u in data.get("value", []) if u.get("userPrincipalName")]
+
+    local = user_id.split("@", 1)[0].replace("'", "''")  # OData string literal
+    try:
+        if local and (found := names(**{"$filter": f"startswith(userPrincipalName,'{local}')"})):
+            return f" Similar sign-in names there: {', '.join(found)}."
+        if found := names():
+            return f" Sign-in names in that tenant look like: {', '.join(found)}."
+    except httpx.HTTPError:
+        return ""
+    return " The app could not list any user in that tenant."
+
+
+def _explain_graph_error(exc: httpx.HTTPStatusError) -> str:
+    """Graph's own error code + message, plus what it usually means here."""
+    try:
+        err = exc.response.json().get("error", {})
+        code, message = str(err.get("code", "")), str(err.get("message", ""))
+    except ValueError:  # not a JSON error body
+        code, message = "", exc.response.text[:300]
+    status = exc.response.status_code
+    hint = ""
+    if code == "MailboxNotEnabledForRESTAPI":
+        hint = (
+            " The account exists but has no Exchange Online mailbox: assign it a license "
+            "(or wait for the mailbox to finish provisioning)."
+        )
+    elif status == 403:
+        hint = (
+            " The app registration lacks an application permission for this call, or admin "
+            "consent has not been granted in this tenant (see Prerequisites in the README)."
+        )
+    elif status == 401:
+        hint = " The token was not accepted: check the tenant block's `cloud`."
+    return (
+        f"Graph answered {status} {code} to {exc.request.method} {exc.request.url}: "
+        f"{message}{hint}"
+    )
+
+
 def _probe_destination(cfg: Config, pilot: UserMapping) -> None:
     from .auth.ms_auth import MSTokenProvider
-    from .microsoft.graph_client import GraphClient
 
     tp = MSTokenProvider.from_config(cfg.destination)
     with GraphClient(tp) as gc:
         console.print(f"[dim]Destination cloud: {cfg.destination.cloud} ({gc.base_url})")
-        user_info = gc.get(f"/users/{pilot.dest_id}")
+        user_info = _resolve_pilot(gc, pilot.dest_id, "dest_id", cfg.destination)
         ms_id = user_info["id"]
         folder = gc.post(
             f"/users/{ms_id}/mailFolders", json={"displayName": "_migrator_smoke_test"}

@@ -13,6 +13,11 @@ from ..config import (
 from .keyfile import KeyFileError, read_private_key
 
 
+class TokenError(RuntimeError):
+    """Entra refused to issue a token (unknown app id, certificate not uploaded
+    to the app registration, wrong tenant or cloud, ...)."""
+
+
 class MSTokenProvider:
     """Thread-safe MSAL confidential-client token provider with disk cache.
 
@@ -95,7 +100,7 @@ class MSTokenProvider:
             if not result:
                 result = self._app.acquire_token_for_client(self._scope)
             if "access_token" not in result:
-                raise RuntimeError(
+                raise TokenError(
                     f"Failed to acquire MS token: {result.get('error_description', result)}"
                 )
             self._persist_cache()

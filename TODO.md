@@ -33,7 +33,16 @@ This file is the single source of truth for the backlog (`CLAUDE.md` points here
   parse the provided public key.` `auth/keyfile.py` parses the file up front
   and says what it is and which tenant block it belongs to; `init-config` runs
   the same check and no longer treats a certificate PEM next to its key as a
-  candidate.
+  candidate. A missing file reports the absolute path tried, and both cases
+  list the private keys that are in the folder; `smoke-test` prints the
+  message without a traceback.
+- **`smoke-test` explains what it finds.** A pilot `source_id` / `dest_id`
+  that does not resolve (Graph 404), a missing permission or consent (403), an
+  account without a mailbox and a refused sign-in are each printed as one line
+  naming the side, tenant and cloud — the 404 with sign-in names read from
+  that tenant — instead of an httpx/tenacity traceback. First live GCC High
+  run (2026-11-19): sign-in and Graph routing on `login.microsoftonline.us` /
+  `graph.microsoft.us` work; workloads are still unexercised there.
 
 ## Recently completed (2026-09-17 mechanism review)
 
@@ -212,12 +221,14 @@ This file is the single source of truth for the backlog (`CLAUDE.md` points here
 
 ## Open — Coverage / functionality
 
-- **GCC High is unverified against a live tenant.** Endpoint routing is unit
-  tested and both `.us` endpoints answer, but no migration has been run in GCC
-  High. Per-API availability there (JSON message create with MAPI extended
-  properties, attachment upload sessions, contact photos, group/site
-  provisioning) is assumed equal to the global cloud. **Change adds:** a pilot
-  run (`smoke-test`, then one user) and fixes for whatever differs.
+- **GCC High workloads are unverified against a live tenant.** Certificate
+  sign-in and Graph routing were confirmed live on 2026-11-19 (a commercial
+  source and a GCC High destination in one `smoke-test` run), but no migration
+  has been run in GCC High. Per-API availability there (JSON message create
+  with MAPI extended properties, attachment upload sessions, contact photos,
+  group/site provisioning) is assumed equal to the global cloud. **Change
+  adds:** a passing `smoke-test`, then a one-user pilot, and fixes for
+  whatever differs.
 
 - **Drive files behind a shared mailbox are left at the source.** A
   `mailbox_type: shared` mapping skips the files workload (no OneDrive) with a
