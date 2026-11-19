@@ -5,10 +5,12 @@ from collections.abc import Iterator
 from typing import Any
 
 import httpx
+import pytest
 
 from migrator.config import Microsoft365SourceConfig, UserMapping
 from migrator.connectors.base import SourceFile
 from migrator.connectors.m365 import M365Source, _drive_key
+from migrator.microsoft.graph_client import GraphClient
 
 _USER = UserMapping(source_id="u@src", dest_id="u@dst")
 
@@ -20,11 +22,24 @@ def _status_error(code: int, text: str = "") -> httpx.HTTPStatusError:
 
 
 class _GC:
+    # Well-known folders this mailbox has, by the name v1.0 addresses them with.
+    # The display names in the listing below are German on purpose: the system
+    # folders must be recognised by id, never by what the mailbox calls them.
+    well_known = {"inbox": "f1", "sentitems": "f2"}
+
     def __init__(self) -> None:
         self.byte_calls: list[tuple[str, dict[str, Any]]] = []
         self.pages: list[str] = []
+        self.gets: list[tuple[str, dict[str, Any]]] = []
 
     def get(self, path: str, **kwargs: Any) -> dict[str, Any]:
+        self.gets.append((path, kwargs))
+        prefix = "/users/UID/mailFolders/"
+        if path.startswith(prefix):
+            name = path[len(prefix):]
+            if name not in self.well_known:
+                raise _status_error(404, "ErrorItemNotFound")
+            return {"id": self.well_known[name]}
         return {"id": "UID"}
 
     def get_bytes(self, path: str, **kwargs: Any) -> bytes:
@@ -40,10 +55,16 @@ class _GC:
         base = path.split("?")[0]
         routes: dict[str, list[dict[str, Any]]] = {
             # mail folders
+            # v1.0 mailFolder: no wellKnownName property is ever returned.
             "/users/UID/mailFolders": [
-                {"id": "f1", "displayName": "Inbox", "wellKnownName": "inbox"}
+                {"id": "f1", "displayName": "Posteingang"},
+                {"id": "f2", "displayName": "Gesendete Elemente"},
+                {"id": "f3", "displayName": "Projekte"},
             ],
-            "/users/UID/mailFolders/f1/childFolders": [],
+            "/users/UID/mailFolders/f1/childFolders": [{"id": "f4", "displayName": "Kunden"}],
+            "/users/UID/mailFolders/f2/childFolders": [],
+            "/users/UID/mailFolders/f3/childFolders": [],
+            "/users/UID/mailFolders/f4/childFolders": [],
             "/users/UID/messages": [
                 {"id": "m1", "parentFolderId": "f1", "isRead": True},
                 {"id": "m404", "parentFolderId": "f1"},
@@ -78,6 +99,87 @@ def test_iter_messages_skips_vanished_and_stubs_failed_fetches() -> None:
     assert msgs[1].raw_mime == b"" and msgs[1].fetch_error.startswith("500")
     # the expected-404 probe is quieted rather than logged as a Graph error
     assert all(kw.get("quiet_statuses") == (404,) for _p, kw in gc.byte_calls)
+
+
+def test_system_folders_are_found_by_well_known_name_not_display_name() -> None:
+    gc = _GC()
+    paths = _source(gc)._folder_paths("UID")
+    assert paths == {
+        "f1": "Inbox",                # "Posteingang": the token, not the local name
+        "f2": "SentItems",
+        "f3": "Projekte",             # an ordinary folder keeps its display name
+        "f4": "Inbox\\Kunden",        # children hang off the token
+    }
+    # Each well-known folder is addressed by name; one this mailbox lacks is a
+    # quiet 404, not an error.
+    lookups = [(p, kw) for p, kw in gc.gets if "/mailFolders/" in p]
+    assert [p.rsplit("/", 1)[1] for p, _ in lookups] == [
+        "inbox", "sentitems", "drafts", "deleteditems", "junkemail", "archive",
+    ]
+    assert all(
+        kw["params"] == {"$select": "id"} and kw["quiet_statuses"] == (404,)
+        for _, kw in lookups
+    )
+    # wellKnownName is beta-only: selecting it on v1.0 is a 400 for the whole mailbox.
+    assert all("wellKnownName" not in page for page in gc.pages)
+
+
+def test_folder_lookup_failure_other_than_404_is_not_swallowed() -> None:
+    class _Denied(_GC):
+        def get(self, path: str, **kwargs: Any) -> dict[str, Any]:
+            if "/mailFolders/" in path:
+                raise _status_error(403, "ErrorAccessDenied")
+            return super().get(path, **kwargs)
+
+    with pytest.raises(httpx.HTTPStatusError) as err:
+        _source(_Denied())._folder_paths("UID")
+    assert err.value.response.status_code == 403
+
+
+def test_mail_folder_requests_are_valid_against_v1_mailfolder() -> None:
+    """Real GraphClient against a transport that answers like Graph v1.0: an
+    unknown $select property is a 400 (which is how the beta-only wellKnownName
+    took down the first live run), and folders are addressable by well-known name."""
+    v1_properties = {
+        "id", "displayName", "parentFolderId", "childFolderCount",
+        "totalItemCount", "unreadItemCount", "isHidden",
+    }
+    by_name = {"inbox": "f1", "deleteditems": "f9"}
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        unknown = set(req.url.params.get("$select", "id").split(",")) - v1_properties
+        if unknown:
+            return httpx.Response(400, json={"error": {
+                "code": "BadRequest",
+                "message": f"Could not find a property named '{unknown.pop()}' on type "
+                           "'microsoft.graph.mailFolder'.",
+            }})
+        path = req.url.path.removeprefix("/v1.0/users/UID/mailFolders")
+        if path == "":
+            return httpx.Response(200, json={"value": [
+                {"id": "f1", "displayName": "Boîte de réception"},
+                {"id": "f9", "displayName": "Éléments supprimés"},
+            ]})
+        if path.endswith("/childFolders"):
+            return httpx.Response(200, json={"value": []})
+        name = path.lstrip("/")
+        if name in by_name:
+            return httpx.Response(200, json={"id": by_name[name]})
+        return httpx.Response(404, json={"error": {"code": "ErrorItemNotFound"}})
+
+    class _Tokens:
+        def get_token(self) -> str:
+            return "tok"
+
+    gc = GraphClient(_Tokens())  # type: ignore[arg-type]
+    gc._client.close()
+    gc._client = httpx.Client(transport=httpx.MockTransport(handler))
+    src = M365Source(Microsoft365SourceConfig(tenant_id="t", client_id="c"), lambda: gc)
+
+    assert src._folder_paths("UID") == {"f1": "Inbox", "f9": "DeletedItems"}
+    assert all(r.method == "GET" for r in seen)  # a source is only ever read
 
 
 # ── contacts ──────────────────────────────────────────────────────────────────

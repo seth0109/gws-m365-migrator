@@ -35,9 +35,11 @@ _EVENT_FIELDS = (
 
 log = logging.getLogger(__name__)
 
-# Graph wellKnownName → canonical token shared with the destination writer
-# (microsoft/mail.py:WELL_KNOWN_FOLDER_IDS) and the other sources, so a system
-# folder maps to the real well-known destination folder rather than a duplicate.
+# Graph well-known folder name → canonical token shared with the destination
+# writer (microsoft/mail.py:WELL_KNOWN_FOLDER_IDS) and the other sources, so a
+# system folder maps to the real well-known destination folder rather than a
+# duplicate. The names are used to *address* the folders (/mailFolders/inbox):
+# the v1.0 mailFolder has no `wellKnownName` property to read them from.
 _WELLKNOWN_TO_TOKEN = {
     "inbox": "Inbox",
     "sentitems": "SentItems",
@@ -100,19 +102,43 @@ class M365Source(BaseSource):
             yield from page
 
     # -- mail --------------------------------------------------------------- #
+    def _well_known_folder_ids(self, uid: str) -> dict[str, str]:
+        """Map the id of each well-known mail folder → its canonical token.
+
+        `wellKnownName` is a beta-only mailFolder property: on v1.0, selecting
+        it is a 400 and it is never returned. v1.0 does let a folder be
+        addressed by its well-known name, whatever the mailbox's language calls
+        it, so each one is looked up that way and matched to the listing by id."""
+        ids: dict[str, str] = {}
+        for name, token in _WELLKNOWN_TO_TOKEN.items():
+            try:
+                folder = self._client().get(
+                    f"/users/{uid}/mailFolders/{name}",
+                    params={"$select": "id"},
+                    user_key=uid,
+                    quiet_statuses=(404,),
+                )
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 404:
+                    continue  # this mailbox has no such folder (e.g. Archive)
+                raise
+            ids[folder["id"]] = token
+        return ids
+
     def _folder_paths(self, uid: str) -> dict[str, str]:
         """Map mailFolder id → destination folder path ("\\"-separated)."""
         paths: dict[str, str] = {}
+        well_known = self._well_known_folder_ids(uid)
 
         def walk(parent_path: str, container: str) -> None:
             for f in self._paginate(
-                f"/users/{uid}/{container}?$top=100&$select=id,displayName,wellKnownName",
+                f"/users/{uid}/{container}?$top=100&$select=id,displayName",
                 user_key=uid,
             ):
                 # Top-level system folders map to a canonical token the destination
                 # writer routes to the real well-known folder; everything else keeps
                 # its display name.
-                token = _WELLKNOWN_TO_TOKEN.get(f.get("wellKnownName") or "")
+                token = well_known.get(f["id"])
                 name = token if (token and not parent_path) else f.get("displayName", f["id"])
                 full = f"{parent_path}\\{name}" if parent_path else name
                 paths[f["id"]] = full

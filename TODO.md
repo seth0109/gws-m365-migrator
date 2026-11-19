@@ -36,6 +36,12 @@ This file is the single source of truth for the backlog (`CLAUDE.md` points here
   candidate. A missing file reports the absolute path tried, and both cases
   list the private keys that are in the folder; `smoke-test` prints the
   message without a traceback.
+- **M365 source mail no longer 400s on the folder listing.** The connector
+  selected `wellKnownName`, which exists only on the beta `mailFolder`; on
+  v1.0 the request is a 400, so the first live tenant-to-tenant mail run (and
+  whatif) failed before reading a message. System folders are now found by
+  addressing each by its well-known name and matching ids, which also makes
+  the mapping independent of the mailbox's language.
 - **`smoke-test` explains what it finds.** A pilot `source_id` / `dest_id`
   that does not resolve (Graph 404), a missing permission or consent (403), an
   account without a mailbox and a refused sign-in are each printed as one line
