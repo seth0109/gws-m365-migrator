@@ -10,6 +10,7 @@ from ..config import (
     Microsoft365DestinationConfig,
     Microsoft365SourceConfig,
 )
+from .keyfile import KeyFileError, read_private_key
 
 
 class MSTokenProvider:
@@ -44,7 +45,9 @@ class MSTokenProvider:
         authority = f"{endpoints.login}/{tenant_id}"
 
         if certificate_path and certificate_thumbprint:
-            cert_data = certificate_path.read_bytes()
+            # Parsed here, before any network call: MSAL only touches the key
+            # at the first token request, and reports a bad one opaquely.
+            cert_data = read_private_key(certificate_path)
             self._app = msal.ConfidentialClientApplication(
                 client_id,
                 authority=authority,
@@ -71,15 +74,20 @@ class MSTokenProvider:
         cls, cfg: Microsoft365SourceConfig | Microsoft365DestinationConfig
     ) -> MSTokenProvider:
         """Build the provider for one tenant block (source or destination)."""
-        return cls(
-            tenant_id=cfg.tenant_id,
-            client_id=cfg.client_id,
-            certificate_path=cfg.certificate_path,
-            certificate_thumbprint=cfg.certificate_thumbprint,
-            client_secret=cfg.client_secret,
-            token_cache_file=cfg.token_cache_file,
-            cloud=cfg.cloud,
-        )
+        try:
+            return cls(
+                tenant_id=cfg.tenant_id,
+                client_id=cfg.client_id,
+                certificate_path=cfg.certificate_path,
+                certificate_thumbprint=cfg.certificate_thumbprint,
+                client_secret=cfg.client_secret,
+                token_cache_file=cfg.token_cache_file,
+                cloud=cfg.cloud,
+            )
+        except KeyFileError as exc:
+            # Two tenants, two key files: say which block the bad one belongs to.
+            block = "source" if isinstance(cfg, Microsoft365SourceConfig) else "destination"
+            raise KeyFileError(f"{block}.{exc}") from exc.__cause__
 
     def get_token(self) -> str:
         with self._lock:

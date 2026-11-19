@@ -339,21 +339,24 @@ def init_config(
         Path | None, typer.Option("--service-account-key", help="Override discovered JSON key")
     ] = None,
     cert: Annotated[
-        Path | None, typer.Option("--cert", help="Override discovered destination PEM")
+        Path | None,
+        typer.Option("--cert", help="Destination PEM private key (overrides discovery)"),
     ] = None,
     source_cert: Annotated[
-        Path | None, typer.Option("--source-cert", help="Override discovered source PEM")
+        Path | None,
+        typer.Option("--source-cert", help="Source PEM private key (overrides discovery)"),
     ] = None,
 ) -> None:
     """Scaffold a config.yaml from CLI inputs, a credentials/ folder, and a mapping CSV.
 
-    Auto-discovers the service-account JSON and certificate PEM(s) in
-    --credentials-dir, reads the user mappings from --mapping, and writes a
-    validated config to --output.
+    Auto-discovers the service-account JSON and the certificate private-key
+    PEM(s) in --credentials-dir, reads the user mappings from --mapping, and
+    writes a validated config to --output.
     """
     from .configgen import (
         ConfigGenError,
         build_config_dict,
+        check_key_files,
         discover_credentials,
         dump_config_yaml,
         parse_mapping_csv,
@@ -371,6 +374,7 @@ def init_config(
             dest_cert=cert,
             source_cert=source_cert,
         )
+        check_key_files(creds)
 
         if mapping is not None:
             users = parse_mapping_csv(mapping)

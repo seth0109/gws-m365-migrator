@@ -27,6 +27,13 @@ This file is the single source of truth for the backlog (`CLAUDE.md` points here
   `binascii.Error: Odd-length string`. Separators are now stripped, and a value
   that is not 40 hex digits is rejected naming the tenant block (`init-config`
   names the flag).
+- **A wrong file in `certificate_path` is named before sign-in.** The field
+  holds the PEM private key, but its name invites the certificate or a .pfx;
+  MSAL then failed the first token request with `InvalidKeyError: Could not
+  parse the provided public key.` `auth/keyfile.py` parses the file up front
+  and says what it is and which tenant block it belongs to; `init-config` runs
+  the same check and no longer treats a certificate PEM next to its key as a
+  candidate.
 
 ## Recently completed (2026-09-17 mechanism review)
 

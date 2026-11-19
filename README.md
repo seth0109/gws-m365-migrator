@@ -73,7 +73,7 @@ openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \
 openssl x509 -in ms-cert.crt -noout -fingerprint -sha1     # SHA-1 thumbprint: 40 hex digits (colons are accepted)
 ```
 
-Upload `ms-cert.crt` to the app registration (Certificates & secrets) and keep `credentials/ms-key.pem` local; `config.yaml` points `certificate_path` at the key file. A `client_secret` is accepted instead, but only by hand-editing the config.
+Upload `ms-cert.crt` to the app registration (Certificates & secrets) and keep `credentials/ms-key.pem` local; `config.yaml` points `certificate_path` at the **key** file (`BEGIN PRIVATE KEY`), not at the certificate. The tool checks this before signing in and says what the file is if it is the certificate, a `.pfx`, or a passphrase-protected key; from a PFX, extract the key with `openssl pkcs12 -in cert.pfx -nocerts -nodes -out credentials/ms-key.pem`. A `client_secret` is accepted instead, but only by hand-editing the config.
 
 ### Source access
 

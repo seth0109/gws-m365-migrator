@@ -89,6 +89,41 @@ def test_discover_missing_pem_raises(tmp_path: Path) -> None:
         discover_credentials(d, "imap")
 
 
+_CERT_PEM = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+_KEY_PEM = "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n"
+
+
+def test_discover_ignores_certificate_files_next_to_their_keys(tmp_path: Path) -> None:
+    # `openssl req -keyout x-key.pem -out x-cert.pem`: two "source" and two "dest"
+    # names, but only the keys can sign — the certificates are not candidates.
+    d = tmp_path / "credentials"
+    d.mkdir()
+    for name in ("source", "dest"):
+        (d / f"{name}-cert.pem").write_text(_CERT_PEM)
+        (d / f"{name}-key.pem").write_text(_KEY_PEM)
+    creds = discover_credentials(d, "microsoft365")
+    assert creds.source_cert == d / "source-key.pem"
+    assert creds.dest_cert == d / "dest-key.pem"
+
+    (d / "source-cert.pem").unlink()
+    (d / "source-key.pem").unlink()
+    assert discover_credentials(d, "imap").dest_cert == d / "dest-key.pem"
+
+
+def test_discover_only_certificates_says_the_key_is_needed(tmp_path: Path) -> None:
+    d = tmp_path / "credentials"
+    d.mkdir()
+    (d / "source-cert.pem").write_text(_CERT_PEM)
+    (d / "dest-cert.pem").write_text(_CERT_PEM)
+    with pytest.raises(ConfigGenError, match="only certificate file.*private key"):
+        discover_credentials(d, "microsoft365")
+    with pytest.raises(ConfigGenError, match="only certificate file"):
+        discover_credentials(d, "imap")
+    # Explicit paths skip discovery entirely (check_key_files vets them later).
+    creds = discover_credentials(d, "imap", dest_cert=tmp_path / "elsewhere.pem")
+    assert creds.dest_cert == tmp_path / "elsewhere.pem"
+
+
 # --------------------------------------------------------------------------- #
 # Mapping CSV parsing
 # --------------------------------------------------------------------------- #

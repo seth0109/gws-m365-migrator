@@ -201,11 +201,14 @@ def test_colon_separated_thumbprint_reaches_msal_decodable(
             seen.append(client_credential["thumbprint"])
 
     monkeypatch.setattr(ms_auth.msal, "ConfidentialClientApplication", _DecodingMsalApp)
+    # The provider parses the key file before it builds the MSAL app.
+    monkeypatch.setattr(ms_auth, "read_private_key", lambda path: path.read_bytes())
     key = tmp_path / "key.pem"
     key.write_bytes(b"-----BEGIN PRIVATE KEY-----\n")
     block = {
         "tenant_id": "t", "client_id": "c", "certificate_path": str(key),
         "certificate_thumbprint": ":".join(_PAIRS),
+        "token_cache_file": str(tmp_path / "cache.json"),
     }
     cfg = Config.model_validate({
         "source": {**block, "type": "microsoft365"},

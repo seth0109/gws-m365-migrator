@@ -20,6 +20,7 @@ from pathlib import Path
 
 import yaml
 
+from .auth.keyfile import KeyFileError, read_private_key
 from .config import CLOUD_ENDPOINTS, Config, normalize_thumbprint, normalize_token
 
 # Source types that can be scaffolded.
@@ -66,6 +67,16 @@ def _pick_cert(pems: list[Path], hints: tuple[str, ...]) -> Path | None:
     return matches[0] if len(matches) == 1 else None
 
 
+def _is_certificate_only(path: Path) -> bool:
+    """True for a PEM that holds a certificate and no private key — the public
+    half, which openssl writes next to the key and which can never sign."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return False
+    return b"-----BEGIN CERTIFICATE-----" in data and b"PRIVATE KEY-----" not in data
+
+
 def discover_credentials(
     cred_dir: Path,
     source_type: str,
@@ -84,11 +95,23 @@ def discover_credentials(
     if not cred_dir.is_dir():
         raise ConfigGenError(
             f"Credentials directory '{cred_dir}' not found. Create it and drop the "
-            f"service-account JSON and/or certificate PEM there, or pass explicit paths."
+            f"service-account JSON and/or the certificate's PEM private key there, or "
+            f"pass explicit paths."
         )
 
     jsons = sorted(p for p in cred_dir.glob("*.json"))
-    pems = sorted(cred_dir.glob("*.pem"))
+    # `openssl req -keyout a-key.pem -out a-cert.pem` leaves the certificate next
+    # to its key. Only the key can sign, so certificate-only PEMs are not
+    # candidates (and must not make the key's filename keyword ambiguous).
+    all_pems = sorted(cred_dir.glob("*.pem"))
+    pems = [p for p in all_pems if not _is_certificate_only(p)]
+    discovering = dest_cert is None or (source_type == "microsoft365" and source_cert is None)
+    if discovering and all_pems and not pems:
+        raise ConfigGenError(
+            f"'{cred_dir}' holds only certificate file(s) {[p.name for p in all_pems]}. "
+            f"The tool signs with the certificate's PEM private key (BEGIN PRIVATE KEY): "
+            f"add that file (openssl's -keyout output), or pass --cert / --source-cert."
+        )
     found = CredentialSet()
 
     # --- service-account JSON (google_workspace only) --------------------- #
@@ -118,8 +141,8 @@ def discover_credentials(
         found.dest_cert = pems[0]
     elif not pems:
         raise ConfigGenError(
-            f"No certificate *.pem found in '{cred_dir}'. Add the destination Entra "
-            f"app certificate (or pass --cert)."
+            f"No certificate *.pem found in '{cred_dir}'. Add the PEM private key of the "
+            f"destination Entra app's certificate (or pass --cert)."
         )
 
     # --- source certificate (microsoft365 source only) -------------------- #
@@ -145,6 +168,23 @@ def discover_credentials(
         )
 
     return found
+
+
+def check_key_files(creds: CredentialSet) -> None:
+    """Fail now if a resolved PEM is not a usable private key.
+
+    The files are called "certificates" throughout, so what sits in
+    `credentials/` is often the certificate itself or a .pfx — which would
+    otherwise scaffold a config that only fails at the first token request."""
+    for path, flag in ((creds.dest_cert, "--cert"), (creds.source_cert, "--source-cert")):
+        if path is None:
+            continue
+        try:
+            read_private_key(path)
+        except KeyFileError as exc:
+            raise ConfigGenError(f"{exc} (pass {flag} to choose another file)") from exc
+        except OSError as exc:
+            raise ConfigGenError(f"Cannot read '{path}': {exc.strerror or exc}") from exc
 
 
 def parse_mapping_csv(path: Path) -> list[dict[str, str]]:
