@@ -113,6 +113,45 @@ def test_iter_messages_lists_without_downloading_and_loads_on_demand() -> None:
     assert all(kw.get("quiet_statuses") == (404,) for _p, kw in gc.byte_calls)
 
 
+def test_messages_carry_a_replayable_state_fingerprint() -> None:
+    from migrator.connectors.base import mail_state_hash, parse_mail_state
+
+    class _WithState(_GC):
+        def paginate(self, path: str, **kwargs: Any) -> Iterator[list[dict[str, Any]]]:
+            if path.startswith("/users/UID/messages"):
+                self.pages.append(path)
+                yield [
+                    {"id": "a", "parentFolderId": "f1", "isRead": False,
+                     "flag": {"flagStatus": "flagged"}, "categories": ["Red", "Blue"]},
+                    {"id": "b", "parentFolderId": "f1", "isRead": True,
+                     "flag": {"flagStatus": "complete"}, "categories": None},
+                ]
+            else:
+                yield from super().paginate(path, **kwargs)
+
+    a, b = list(_source(_WithState()).iter_messages(_USER, None))
+    assert (a.is_read, a.is_flagged, a.categories) == (False, True, ["Red", "Blue"])
+    assert parse_mail_state(a.state_hash) == (False, True, ["Blue", "Red"])  # order-free
+    assert a.state_hash == mail_state_hash(False, True, ["Blue", "Red"])
+    assert parse_mail_state(b.state_hash) == (True, False, [])
+    # Anything that is not such a fingerprint (older rows hold a Message-ID):
+    assert parse_mail_state("<id@host>") is None and parse_mail_state(None) is None
+
+
+def test_mail_delta_lists_the_whole_mailbox_when_state_is_replayed() -> None:
+    gc = _GC()
+    src = M365Source(
+        Microsoft365SourceConfig(tenant_id="t", client_id="c"), lambda: gc,  # type: ignore[arg-type, return-value]
+        replay_mail_state=True,
+    )
+    list(src.iter_messages(_USER, "2026-11-19T20:05:00Z"))
+    page = next(p for p in gc.pages if p.startswith("/users/UID/messages"))
+    # No date filter: read/flag changes are found by comparing state, since it is
+    # undocumented whether they move a message's lastModifiedDateTime.
+    assert "$filter" not in page
+    assert "$top=500" in page and "isRead,flag,categories" in page
+
+
 def test_mail_delta_filter_overlaps_the_cursor() -> None:
     # The cursor is this machine's clock at the start of the previous pass; the
     # filter reaches 10 minutes before it so clock skew cannot open a gap.

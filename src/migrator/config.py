@@ -240,6 +240,11 @@ class MailWorkloadConfig(WorkloadConfig):
     # sent/received dates. "mime" posts raw MIME — byte-perfect content, but
     # Graph documents that path as creating *drafts* dated at import time.
     import_mode: Literal["json", "mime"] = "json"
+    # On a delta pass, re-apply read/unread, follow-up flag and categories that
+    # changed at the source after a message was migrated (Microsoft 365 source).
+    # The delta then lists the whole mailbox (metadata only) instead of just
+    # recent mail. Folder moves and deletions are not replayed.
+    replay_read_state: bool = True
 
 
 class WorkloadsConfig(BaseModel):

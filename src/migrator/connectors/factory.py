@@ -52,6 +52,10 @@ def build_source(
 
         if source_graph_client_factory is None:
             raise ValueError("microsoft365 source requires a source Graph client factory")
-        return M365Source(src, source_graph_client_factory)
+        return M365Source(
+            src,
+            source_graph_client_factory,
+            replay_mail_state=cfg.workloads.mail.replay_read_state,
+        )
 
     raise ValueError(f"Unsupported source type: {cfg.source.type!r}")

@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
-from ..connectors.base import SourceMessage
+import httpx
+
+from ..connectors.base import SourceMessage, parse_mail_state
 from ..context import JobContext
 from ..microsoft.mail import (
     ensure_mail_folder,
     import_message,
     patch_message_flags,
     resolve_folder_segment,
+    set_message_state,
 )
-from ..state.db import is_done, session_scope, upsert_folder, upsert_item
+from ..state.db import get_item_state, session_scope, upsert_folder, upsert_item
 from .cursors import advance_cursor, delta_since
 
 log = logging.getLogger(__name__)
@@ -78,11 +82,63 @@ def run_mail(ctx: JobContext) -> None:
                             msg.source_id, exc)
         return dest
 
+    # Delta only: a message that is already migrated and whose read/flag/category
+    # state has changed at the source since it was recorded gets that change
+    # re-applied. A full pass stays a pure idempotent skip.
+    replay = ctx.mode == "delta" and ctx.config.workloads.mail.replay_read_state
+    replayed = gone = 0
+
+    def _replay_state(msg: SourceMessage, dest_id: str, recorded: str | None) -> None:
+        """Best-effort: never fails the item or holds the cursor."""
+        nonlocal replayed, gone
+        changes: dict[str, Any] = {
+            "is_read": msg.is_read,
+            "is_flagged": msg.is_flagged,
+            "categories": sorted(msg.categories),
+        }
+        before = parse_mail_state(recorded)
+        if before is not None:
+            # Send only what changed at the source, so anything the user has
+            # since set on the other aspects in the new mailbox is left alone.
+            was_read, was_flagged, had_categories = before
+            if was_read == msg.is_read:
+                del changes["is_read"]
+            if was_flagged == msg.is_flagged:
+                del changes["is_flagged"]
+            if sorted(had_categories) == changes["categories"]:
+                del changes["categories"]
+        try:
+            set_message_state(gc, ms_user_id, dest_id, **changes)
+            replayed += 1
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 404:
+                log.warning("Could not update read/flag state of %s (retried on the next "
+                            "delta): %s", msg.source_id, exc)
+                return
+            # Moved or deleted in the new mailbox: its id there changed or it is
+            # gone. That was the user's doing; record the state and move on.
+            gone += 1
+        except Exception as exc:  # noqa: BLE001 - fidelity extra, not a migration failure
+            log.warning("Could not update read/flag state of %s (retried on the next "
+                        "delta): %s", msg.source_id, exc)
+            return
+        with session_scope() as s:
+            upsert_item(
+                s, user.source_id, "mail", msg.source_id,
+                source_hash=msg.state_hash, dest_id=dest_id, status="done",
+            )
+
     failures = 0
     for msg in ctx.source.iter_messages(user, since):
         with session_scope() as s:
-            if is_done(s, user.source_id, "mail", msg.source_id):
-                continue
+            state = get_item_state(s, user.source_id, "mail", msg.source_id)
+        if state is not None and state.status == "done":
+            if (
+                replay and msg.state_hash and state.dest_id
+                and state.source_hash != msg.state_hash
+            ):
+                _replay_state(msg, state.dest_id, state.source_hash)
+            continue
 
         if msg.load_mime is not None and not msg.fetch_error:
             # Lazy body: read from the source only now that the message is known
@@ -127,7 +183,11 @@ def run_mail(ctx: JobContext) -> None:
         with session_scope() as s:
             upsert_item(
                 s, user.source_id, "mail", msg.source_id,
-                source_hash=msg.dedup_hash or None, dest_id=dest_id, status="done",
+                # The state just written at the destination, when the connector
+                # can report it again later (see _replay_state); else the
+                # Message-ID.
+                source_hash=msg.state_hash or msg.dedup_hash or None,
+                dest_id=dest_id, status="done",
             )
 
         # Best-effort extra copies (multi_label_policy="duplicate"): the primary
@@ -138,6 +198,16 @@ def run_mail(ctx: JobContext) -> None:
             except Exception as exc:  # noqa: BLE001 - primary copy already imported
                 log.warning("Extra folder copy %s failed for %s (primary imported): %s",
                             folder_path, msg.source_id, exc)
+
+    if replayed or gone:
+        left_alone = (
+            f"; {gone} more were moved or deleted in the new mailbox and left alone"
+            if gone else ""
+        )
+        log.info(
+            "Read/flag state replayed onto %d already-migrated message(s) for %s%s",
+            replayed, user.source_id, left_alone,
+        )
 
     advance_cursor(ctx, "mail", failures, "message(s)")
 

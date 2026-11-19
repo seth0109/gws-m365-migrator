@@ -734,3 +734,28 @@ def patch_message_flags(
     if is_flagged:
         body["flag"] = {"flagStatus": "flagged"}
     gc.patch(f"/users/{ms_user_id}/messages/{message_id}", user_key=ms_user_id, json=body)
+
+
+def set_message_state(
+    gc: GraphClient,
+    ms_user_id: str,
+    message_id: str,
+    *,
+    is_read: bool | None = None,
+    is_flagged: bool | None = None,
+    categories: list[str] | None = None,
+) -> None:
+    """Set the given aspects of an existing message to exactly these values.
+
+    Unlike `patch_message_flags` (which only ever adds, right after an import),
+    this also clears: False un-reads/un-flags and [] removes every category. An
+    aspect left as None is not sent, so it keeps whatever the mailbox has."""
+    body: dict[str, Any] = {}
+    if is_read is not None:
+        body["isRead"] = is_read
+    if is_flagged is not None:
+        body["flag"] = {"flagStatus": "flagged" if is_flagged else "notFlagged"}
+    if categories is not None:
+        body["categories"] = categories
+    if body:
+        gc.patch(f"/users/{ms_user_id}/messages/{message_id}", user_key=ms_user_id, json=body)

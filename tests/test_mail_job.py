@@ -11,10 +11,11 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from migrator.config import Config, UserMapping
-from migrator.connectors.base import BaseSource, SourceMessage
+from migrator.connectors.base import BaseSource, SourceMessage, mail_state_hash
 from migrator.context import JobContext
 from migrator.state.db import get_cursor, init_db, session_scope
 from migrator.state.models import ItemMap
@@ -63,10 +64,17 @@ class _DestGC:
     def patch(self, path: str, **kwargs: Any) -> None:
         if self.fail_patches:
             raise RuntimeError("patch boom")
+        if self.patch_status:
+            req = httpx.Request("PATCH", f"https://graph.microsoft.com/v1.0{path}")
+            raise httpx.HTTPStatusError(
+                "boom", request=req, response=httpx.Response(self.patch_status, request=req)
+            )
         self.patches.append((path, kwargs))
 
+    patch_status = 0  # set to an HTTP status to make every PATCH fail with it
 
-def _config(import_mode: str = "json") -> Config:
+
+def _config(import_mode: str = "json", replay: bool = True) -> Config:
     return Config.model_validate({
         "source": {
             "type": "google_workspace",
@@ -77,7 +85,7 @@ def _config(import_mode: str = "json") -> Config:
             "type": "microsoft365", "tenant_id": "t", "client_id": "c", "client_secret": "s",
         },
         "users": [{"source_id": "a@old.com", "dest_id": "a@new.com"}],
-        "workloads": {"mail": {"import_mode": import_mode}},
+        "workloads": {"mail": {"import_mode": import_mode, "replay_read_state": replay}},
     })
 
 
@@ -99,13 +107,15 @@ def _run(
     import_mode: str = "json",
     fresh_db: bool = True,
     cursor: str = "hist-42",
+    replay: bool = True,
 ) -> _MailSource:
     if fresh_db:
         init_db(tmp_path / "state.db")
     source = _MailSource(messages, cursor)
     ctx = JobContext(
         user=UserMapping(source_id="a@old.com", dest_id="a@new.com"),
-        source=source, dest_gc=gc, mode=mode, config=_config(import_mode),  # type: ignore[arg-type]
+        source=source, dest_gc=gc, mode=mode,  # type: ignore[arg-type]
+        config=_config(import_mode, replay),
     )
     run_mail(ctx)
     return source
@@ -286,3 +296,120 @@ def test_lazy_body_vanished_is_skipped_and_unreadable_fails_only_that_item(
     with session_scope() as s:
         err = s.execute(select(ItemMap.last_error).where(ItemMap.source_id == "bad")).scalar_one()
     assert err == "503: ServiceUnavailable"
+
+
+# ── delta replays read/flag/category changes onto migrated mail ──────────────
+
+
+def _stateful(
+    msg_id: str, *, read: bool = True, flagged: bool = False, categories: tuple[str, ...] = ()
+) -> SourceMessage:
+    """A message as a state-reporting connector (the M365 source) emits it."""
+    m = _msg(msg_id, unread=not read)
+    m.is_flagged = flagged
+    m.categories = list(categories)
+    m.state_hash = mail_state_hash(read, flagged, list(categories))
+    return m
+
+
+def _patch_bodies(gc: _DestGC) -> dict[str, dict[str, Any]]:
+    return {path.rsplit("/", 1)[1]: kw["json"] for path, kw in gc.patches}
+
+
+def test_delta_replays_only_what_changed_at_the_source(tmp_path: Path) -> None:
+    gc = _DestGC()
+    _run(tmp_path, [
+        _stateful("m1", read=False),
+        _stateful("m2", flagged=True),
+        _stateful("m3", categories=("Red",)),
+    ], gc)
+    assert gc.patches == []  # json import carries the state on the create
+
+    # Since the full pass the user read m1, cleared m2's flag and re-categorised
+    # it, and left m3 alone.
+    after = [
+        _stateful("m1", read=True),
+        _stateful("m2", flagged=False, categories=("Blue",)),
+        _stateful("m3", categories=("Red",)),
+    ]
+    _run(tmp_path, after, gc, mode="delta", fresh_db=False)
+    assert len(gc.posts) == 3  # nothing re-imported
+    assert _patch_bodies(gc) == {
+        "dest-1": {"isRead": True},  # only the aspect that changed is sent
+        "dest-2": {"flag": {"flagStatus": "notFlagged"}, "categories": ["Blue"]},
+    }
+    assert all(p.startswith("/users/ms-uid/messages/") for p, _ in gc.patches)
+
+    # The new state is recorded: the same listing again changes nothing.
+    gc.patches.clear()
+    _run(tmp_path, after, gc, mode="delta", fresh_db=False)
+    assert gc.patches == []
+
+
+def test_unchanged_source_never_overwrites_the_new_mailbox(tmp_path: Path) -> None:
+    # After cutover the user works in the new mailbox. The source is frozen, so
+    # its state equals what was recorded and no PATCH can clobber their changes.
+    gc = _DestGC()
+    _run(tmp_path, [_stateful("m1", read=False)], gc)
+    for _ in range(2):
+        _run(tmp_path, [_stateful("m1", read=False)], gc, mode="delta", fresh_db=False)
+    assert gc.patches == []
+
+
+def test_full_rerun_and_disabled_replay_leave_migrated_mail_alone(tmp_path: Path) -> None:
+    gc = _DestGC()
+    _run(tmp_path, [_stateful("m1", read=False)], gc)
+    changed = [_stateful("m1", read=True)]
+    _run(tmp_path, changed, gc, mode="full", fresh_db=False)  # full pass: pure skip
+    _run(tmp_path, changed, gc, mode="delta", fresh_db=False, replay=False)
+    assert gc.patches == [] and len(gc.posts) == 1
+
+
+def test_copy_moved_or_deleted_in_the_new_mailbox_is_left_alone(tmp_path: Path) -> None:
+    gc = _DestGC()
+    _run(tmp_path, [_stateful("m1", read=False)], gc)
+    gc.patch_status = 404  # the user moved/deleted it there: its id is gone
+    _run(tmp_path, [_stateful("m1", read=True)], gc, mode="delta", fresh_db=False,
+         cursor="hist-50")
+    assert _item_statuses()["m1"] == ("done", "dest-1")  # not a failure
+    with session_scope() as s:
+        assert get_cursor(s, "a@old.com", "mail") == "hist-50"
+
+    # ...and it is not attempted again on every later delta.
+    gc.patch_status = 0
+    _run(tmp_path, [_stateful("m1", read=True)], gc, mode="delta", fresh_db=False)
+    assert gc.patches == []
+
+
+def test_replay_error_is_retried_by_the_next_delta_and_never_fails_the_run(
+    tmp_path: Path,
+) -> None:
+    gc = _DestGC()
+    _run(tmp_path, [_stateful("m1", read=False)], gc)
+    gc.patch_status = 503
+    _run(tmp_path, [_stateful("m1", read=True)], gc, mode="delta", fresh_db=False,
+         cursor="hist-50")
+    assert _item_statuses()["m1"] == ("done", "dest-1")
+    with session_scope() as s:
+        # A fidelity extra never holds the cursor back.
+        assert get_cursor(s, "a@old.com", "mail") == "hist-50"
+
+    gc.patch_status = 0
+    _run(tmp_path, [_stateful("m1", read=True)], gc, mode="delta", fresh_db=False)
+    assert _patch_bodies(gc) == {"dest-1": {"isRead": True}}
+
+
+def test_row_recorded_before_state_tracking_gets_the_whole_state_once(tmp_path: Path) -> None:
+    gc = _DestGC()
+    legacy = _msg("m1")
+    legacy.dedup_hash = "<m1@old.com>"  # what such rows hold: a Message-ID
+    _run(tmp_path, [legacy], gc)
+
+    now = [_stateful("m1", read=True, flagged=True)]
+    _run(tmp_path, now, gc, mode="delta", fresh_db=False)
+    assert _patch_bodies(gc) == {
+        "dest-1": {"isRead": True, "flag": {"flagStatus": "flagged"}, "categories": []},
+    }
+    gc.patches.clear()
+    _run(tmp_path, now, gc, mode="delta", fresh_db=False)
+    assert gc.patches == []

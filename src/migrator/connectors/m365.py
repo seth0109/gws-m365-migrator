@@ -17,6 +17,7 @@ from .base import (
     SourceEvent,
     SourceFile,
     SourceMessage,
+    mail_state_hash,
 )
 
 # Fields safe to copy when re-creating a contact/event in the destination tenant
@@ -52,6 +53,11 @@ _WELLKNOWN_TO_TOKEN = {
 
 
 _TS = "%Y-%m-%dT%H:%M:%SZ"
+
+# Page size for message listings (Graph allows 1-1000). They select a handful of
+# small properties, and bodies are fetched separately, so a large page is cheap;
+# it matters because a re-run or a state-replaying delta lists the whole mailbox.
+_MAIL_PAGE = 500
 
 # Mail, contacts and calendar deltas filter on a timestamp taken from *this
 # machine's* clock at the start of the previous pass. A clock running ahead of
@@ -93,11 +99,17 @@ class M365Source(BaseSource):
     capabilities = {"mail", "files", "contacts", "calendar"}
 
     def __init__(
-        self, cfg: Microsoft365SourceConfig, gc_factory: Callable[[], GraphClient]
+        self,
+        cfg: Microsoft365SourceConfig,
+        gc_factory: Callable[[], GraphClient],
+        replay_mail_state: bool = False,
     ) -> None:
         super().__init__()
         self.cfg = cfg
         self._gc_factory = gc_factory
+        # When set, a mail delta lists the whole mailbox rather than only recent
+        # mail, so the job can compare each migrated message's read/flag state.
+        self._replay_mail_state = replay_mail_state
         self._gc: GraphClient | None = None
         self._user_ids: dict[str, str] = {}
 
@@ -172,10 +184,16 @@ class M365Source(BaseSource):
         self._set_cursor("mail", _now_z())
         folder_paths = self._folder_paths(uid)
         select = "id,parentFolderId,isRead,flag,categories,subject"
-        path = f"/users/{uid}/messages?$select={select}&$top=50"
-        if since:
+        path = f"/users/{uid}/messages?$select={select}&$top={_MAIL_PAGE}"
+        if since and not self._replay_mail_state:
             path += f"&$filter=receivedDateTime ge {_with_overlap(since)}"
+        # Otherwise (a full pass, or a delta that replays read/flag state) every
+        # message is listed: whether read/flag changes move lastModifiedDateTime
+        # is not documented, so the state is compared rather than filtered for.
         for msg in self._paginate(path, user_key=uid):
+            is_read = bool(msg.get("isRead", True))
+            is_flagged = (msg.get("flag", {}) or {}).get("flagStatus") == "flagged"
+            categories = list(msg.get("categories") or [])
             yield SourceMessage(
                 source_id=msg["id"],
                 raw_mime=b"",
@@ -184,10 +202,11 @@ class M365Source(BaseSource):
                 # that is already migrated.
                 load_mime=partial(self._fetch_mime, uid, msg["id"]),
                 folder_paths=[folder_paths.get(msg.get("parentFolderId", ""), "Inbox")],
-                categories=msg.get("categories", []),
-                is_read=msg.get("isRead", True),
-                is_flagged=(msg.get("flag", {}) or {}).get("flagStatus") == "flagged",
+                categories=categories,
+                is_read=is_read,
+                is_flagged=is_flagged,
                 dedup_hash=msg["id"],
+                state_hash=mail_state_hash(is_read, is_flagged, categories),
                 subject=msg.get("subject", ""),
             )
 

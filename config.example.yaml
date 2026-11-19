@@ -162,6 +162,11 @@ workloads:
     import_mode: json
     # Gmail only. Migrate Spam/Trash too (-> Junk Email / Deleted Items).
     include_spam_trash: true
+    # Microsoft 365 source only. On a `delta`, re-apply read/unread, follow-up
+    # flag and categories that changed at the source since a message was
+    # migrated. The delta then lists the whole mailbox (headers only) rather
+    # than just recent mail. Folder moves and deletions are not replayed.
+    replay_read_state: true
 
 # -- RATE LIMITS --------------------------------------------------------------
 # Token buckets shared by all threads. Lower these if either side throttles.

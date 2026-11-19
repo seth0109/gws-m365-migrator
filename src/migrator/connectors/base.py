@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -8,6 +9,32 @@ from ..config import UserMapping
 
 # Canonical workload names a source may advertise in `capabilities`.
 WORKLOADS = frozenset({"mail", "files", "contacts", "calendar"})
+
+
+# --------------------------------------------------------------------------- #
+# Replayable message state (read/unread, follow-up flag, categories).
+#
+# A connector that can re-list already-migrated mail stamps this fingerprint on
+# each message (`SourceMessage.state_hash`). The mail job records it at import
+# and, on a delta pass, compares the source's current fingerprint against the
+# recorded one: only what changed *at the source* is re-applied, so a change
+# the user made in the new mailbox is never overwritten by an unchanged source.
+# --------------------------------------------------------------------------- #
+def mail_state_hash(is_read: bool, is_flagged: bool, categories: list[str]) -> str:
+    return json.dumps(
+        [int(is_read), int(is_flagged), sorted(categories)],
+        separators=(",", ":"), ensure_ascii=False,
+    )
+
+
+def parse_mail_state(value: str | None) -> tuple[bool, bool, list[str]] | None:
+    """Inverse of mail_state_hash; None for anything else (e.g. the Message-ID
+    older rows stored in the same column)."""
+    try:
+        read, flagged, categories = json.loads(value or "")
+        return bool(read), bool(flagged), [str(c) for c in categories]
+    except (ValueError, TypeError):
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -27,6 +54,10 @@ class SourceMessage:
     is_read: bool = True
     is_flagged: bool = False
     dedup_hash: str = ""  # Message-ID or equivalent, used as source_hash
+    # mail_state_hash(...) of the fields above, set by connectors whose delta
+    # re-lists migrated mail; recorded as source_hash in place of dedup_hash and
+    # compared on the next delta to replay read/flag/category changes.
+    state_hash: str = ""
     # Inventory/reporting metadata:
     subject: str = ""
     size_bytes: int | str = ""

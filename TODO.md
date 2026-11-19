@@ -36,6 +36,13 @@ This file is the single source of truth for the backlog (`CLAUDE.md` points here
   candidate. A missing file reports the absolute path tried, and both cases
   list the private keys that are in the folder; `smoke-test` prints the
   message without a traceback.
+- **Mail delta replays read/unread, flag and category changes (M365 source).**
+  `workloads.mail.replay_read_state` (default true). The connector fingerprints
+  each message's state; the job records it at import and, on a delta, PATCHes
+  only the aspects that changed at the source onto the migrated copy. A frozen
+  source therefore never rewrites what a user did in the new mailbox. The delta
+  lists the whole mailbox (headers only) to compare. Unverified against a live
+  tenant; folder moves and deletions are still not replayed.
 - **Delta passes made dependable (M365 source audit before the first pilot).**
   - *Stable source ids.* The source client sends `Prefer:
     IdType="ImmutableId"` (`source.immutable_ids`, default true). Regular
@@ -198,12 +205,26 @@ This file is the single source of truth for the backlog (`CLAUDE.md` points here
   is the intended single placement. Whatif notes ("folders: Inbox+1 more") make
   the current behaviour visible.
 
-- **Mail delta adds new messages only.** Read/flag/label changes, moves
-  between folders and deletions of an already-migrated message are never
-  applied (Gmail history is enumerated for `messageAdded`; M365 filters on
-  `receivedDateTime`). Contacts/calendar/files now update in place; mail does
-  not. After a long gap between the full pass and cutover, users see mail they
-  had read, filed or deleted back in its old state.
+- **Mail delta does not replay folder moves or deletions; Gmail/IMAP replay
+  nothing.** An M365 source replays read/flag/category changes (see Recently
+  completed), but a migrated message the user has since filed elsewhere stays
+  in its old folder at the destination, and one they deleted stays. Gmail
+  history is enumerated for `messageAdded` only and IMAP by new UIDs, so
+  neither re-lists migrated mail at all. After a long gap between the full
+  pass and cutover, users see filed or deleted mail back in its old place.
+  **Change adds:** for M365, record the source folder per message and move the
+  destination copy when it differs (the delta already lists
+  `parentFolderId`), taking the new destination id from the move response;
+  for Gmail/IMAP, re-list state (labelAdded/labelRemoved history, FLAGS) and
+  set `SourceMessage.state_hash`.
+
+- **A state-replaying mail delta costs a full mailbox listing.** Each delta
+  lists every message's headers (500 per page) and does one state lookup per
+  message, because it is undocumented whether read/flag changes move
+  `lastModifiedDateTime`. Fine for hundreds of mailboxes, slow for thousands.
+  **Change adds:** per-folder `messages/delta` tokens, or a verified
+  `lastModifiedDateTime` filter; preload a mailbox's `ItemMap` rows instead of
+  one query per message.
 
 - **Timestamp-based delta for mail/contacts/calendar (M365 source) is
   adds-and-edits only.** Only files use real Graph delta tokens; the M365
