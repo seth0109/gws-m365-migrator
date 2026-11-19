@@ -82,3 +82,20 @@ def test_example_m365_and_sharepoint_blocks_parse() -> None:
     )
     assert len(cfg.sharepoint_sites) == 2
     assert cfg.sharepoint_sites[0].dest_site and cfg.sharepoint_sites[1].target_site_alias
+
+
+def test_example_documents_cloud_and_shared_mailbox() -> None:
+    raw = yaml.safe_load(_EXAMPLE.read_text(encoding="utf-8"))
+    assert raw["destination"]["cloud"] == "global"  # the field is shown, at its default
+    m365 = _uncommented("* Option 3", "# -- DESTINATION")
+    assert isinstance(m365, dict) and m365["source"]["cloud"] == "global"
+    shared = _uncommented("# Shared mailbox", "# IMAP source only", strip="  # ")
+    cfg = Config.model_validate({**raw, "users": shared})
+    assert cfg.users[0].mailbox_type == "shared"
+
+
+def test_example_users_csv_parses() -> None:
+    from migrator.configgen import parse_mapping_csv
+
+    users = parse_mapping_csv(_EXAMPLE.with_name("users.example.csv"))
+    assert [u.get("mailbox_type", "user") for u in users] == ["user", "user", "shared"]

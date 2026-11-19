@@ -4,7 +4,8 @@ Pure, network-free logic for scaffolding a `config.yaml` from a few CLI inputs
 plus whatever credential files already sit in a `credentials/` folder:
 
 - discover the service-account JSON / certificate PEM(s) on disk,
-- read a user-mapping CSV (``source_id,dest_id[,imap_user,imap_password_env]``),
+- read a user-mapping CSV
+  (``source_id,dest_id[,imap_user,imap_password_env,mailbox_type]``),
 - assemble a `Config`-shaped dict, validate it, and dump it to YAML.
 
 Keeping the assembly here (rather than in `cli.py`) mirrors the project's
@@ -19,10 +20,13 @@ from pathlib import Path
 
 import yaml
 
-from .config import Config
+from .config import CLOUD_ENDPOINTS, Config, normalize_token
 
 # Source types that can be scaffolded.
 SOURCE_TYPES = ("google_workspace", "imap", "microsoft365")
+
+# Accepted `mailbox_type` cells; "user" is the model default and is not written.
+_MAILBOX_TYPES = ("user", "shared")
 
 # Filename keywords used to disambiguate PEMs when more than one is present.
 _SOURCE_HINTS = ("source", "src")
@@ -39,6 +43,8 @@ _CSV_ALIASES: dict[str, str] = {
     "to": "dest_id",
     "imap_user": "imap_user",
     "imap_password_env": "imap_password_env",
+    "mailbox_type": "mailbox_type",
+    "mailbox": "mailbox_type",
 }
 
 
@@ -145,8 +151,9 @@ def parse_mapping_csv(path: Path) -> list[dict[str, str]]:
     """Parse a user-mapping CSV into UserMapping-shaped dicts.
 
     Required columns: ``source_id`` and ``dest_id`` (header aliases accepted,
-    case-insensitive). Optional: ``imap_user``, ``imap_password_env``. Empty
-    optional cells are dropped so they don't override model defaults.
+    case-insensitive). Optional: ``imap_user``, ``imap_password_env``,
+    ``mailbox_type`` (``user`` | ``shared``). Empty optional cells are dropped
+    so they don't override model defaults.
     """
     if not path.is_file():
         raise ConfigGenError(f"Mapping CSV '{path}' not found.")
@@ -181,6 +188,15 @@ def parse_mapping_csv(path: Path) -> list[dict[str, str]]:
                 raise ConfigGenError(
                     f"Mapping CSV '{path}' line {lineno}: both source_id and dest_id required."
                 )
+            if "mailbox_type" in entry:
+                kind = str(normalize_token(entry.pop("mailbox_type")))
+                if kind not in _MAILBOX_TYPES:
+                    raise ConfigGenError(
+                        f"Mapping CSV '{path}' line {lineno}: mailbox_type must be one of "
+                        f"{_MAILBOX_TYPES} (got '{kind}')."
+                    )
+                if kind != "user":
+                    entry["mailbox_type"] = kind
             users.append(entry)
 
     if not users:
@@ -188,13 +204,24 @@ def parse_mapping_csv(path: Path) -> list[dict[str, str]]:
     return users
 
 
+def _resolve_cloud(value: str, flag: str) -> str:
+    cloud = str(normalize_token(value))
+    if cloud not in CLOUD_ENDPOINTS:
+        raise ConfigGenError(
+            f"Unknown {flag} '{value}'. Choose from {tuple(CLOUD_ENDPOINTS)} "
+            f"(GCC High is 'gcc_high'; plain GCC uses the global endpoints)."
+        )
+    return cloud
+
+
 def _ms_block(
-    tenant_id: str, client_id: str, cert: Path, thumbprint: str, cache: str
+    tenant_id: str, client_id: str, cert: Path, thumbprint: str, cache: str, cloud: str
 ) -> dict[str, object]:
     return {
         "type": "microsoft365",
         "tenant_id": tenant_id,
         "client_id": client_id,
+        "cloud": cloud,
         "certificate_path": str(cert),
         "certificate_thumbprint": thumbprint,
         "token_cache_file": cache,
@@ -216,10 +243,13 @@ def build_config_dict(
     source_tenant_id: str | None = None,
     source_client_id: str | None = None,
     source_thumbprint: str | None = None,
+    dest_cloud: str = "global",
+    source_cloud: str = "global",
 ) -> dict[str, object]:
     """Assemble (and validate) a `Config`-shaped dict ready to dump as YAML."""
     if source_type not in SOURCE_TYPES:
         raise ConfigGenError(f"Unknown source type '{source_type}'. Choose from {SOURCE_TYPES}.")
+    dest_cloud = _resolve_cloud(dest_cloud, "--cloud")
 
     # --- source block ----------------------------------------------------- #
     source: dict[str, object]
@@ -257,11 +287,13 @@ def build_config_dict(
             creds.source_cert,
             source_thumbprint,  # type: ignore[arg-type]
             ".ms_source_token_cache.json",
+            _resolve_cloud(source_cloud, "--source-cloud"),
         )
 
     assert creds.dest_cert is not None
     destination = _ms_block(
-        dest_tenant_id, dest_client_id, creds.dest_cert, dest_thumbprint, ".ms_token_cache.json"
+        dest_tenant_id, dest_client_id, creds.dest_cert, dest_thumbprint,
+        ".ms_token_cache.json", dest_cloud,
     )
 
     cfg: dict[str, object] = {

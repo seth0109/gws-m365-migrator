@@ -4,6 +4,24 @@ Open work items identified during review, roughly ordered by data-fidelity
 impact. None of the **Open** items are wired up yet — treat as the backlog.
 This file is the single source of truth for the backlog (`CLAUDE.md` points here).
 
+## Recently completed (2026-11-19 GCC High + shared mailboxes)
+
+- **National clouds.** `destination.cloud` / `source.cloud`
+  (`global` | `gcc` | `gcc_high` | `dod` | `china`) select the Entra authority,
+  token scope and Graph service root per tenant; `init-config` takes `--cloud`
+  / `--source-cloud`. Previously `login.microsoftonline.com` and
+  `graph.microsoft.com` were hardcoded in five modules, so a GCC High tenant
+  could not authenticate at all. Next/delta links and upload URLs on the
+  cloud's own hosts are routed and authenticated per client.
+- **Shared mailboxes.** `users[].mailbox_type: shared` (CSV column
+  `mailbox_type`). Mail, contacts and calendar already worked through
+  `/users/{upn}`; the files workload now skips the mapping instead of polling
+  ~2.5 min for a OneDrive that cannot exist and failing the run.
+- **OneDrive file names with `#` / `%` upload correctly.** The name is
+  percent-encoded in path-based addressing; a raw `#` (possible from an M365
+  source, which does not sanitize names) became a URL fragment and truncated
+  the upload path.
+
 ## Recently completed (2026-09-17 mechanism review)
 
 - **`--user <unmatched>` no longer runs every user.** The CLI exits 1 when the
@@ -181,6 +199,25 @@ This file is the single source of truth for the backlog (`CLAUDE.md` points here
 
 ## Open — Coverage / functionality
 
+- **GCC High is unverified against a live tenant.** Endpoint routing is unit
+  tested and both `.us` endpoints answer, but no migration has been run in GCC
+  High. Per-API availability there (JSON message create with MAPI extended
+  properties, attachment upload sessions, contact photos, group/site
+  provisioning) is assumed equal to the global cloud. **Change adds:** a pilot
+  run (`smoke-test`, then one user) and fixes for whatever differs.
+
+- **Drive files behind a shared mailbox are left at the source.** A
+  `mailbox_type: shared` mapping skips the files workload (no OneDrive) with a
+  warning, and whatif does not inventory those files. **Change adds:** an
+  optional per-mapping files target (another user's OneDrive or a SharePoint
+  library), and whatif rows marked `skip` so the left-behind files are listed.
+
+- **Shared-mailbox flag is not verified.** Nothing checks that a flagged
+  `dest_id` is a shared mailbox, or that an unflagged one is not (the latter
+  surfaces only as the OneDrive provisioning timeout, whose message now points
+  at the setting). **Change adds:** a pre-flight read of
+  `mailboxSettings.userPurpose` (needs `MailboxSettings.Read`).
+
 - **No permissions/sharing migration.** `SourceFile` carries no ACL data.
   **Change adds:** a permissions model on `SourceFile` plus a destination
   writer that recreates sharing.
@@ -247,9 +284,9 @@ This file is the single source of truth for the backlog (`CLAUDE.md` points here
 - **`reporting.py` interpolates unescaped strings into HTML.**
   **Change adds:** `html.escape` on user/error fields.
 - **`JobRun.finished_at` / counts never populated.**
-- **Baseline lint/type debt:** ruff 10 (8 E501 + 2 UP028), mypy 20 (untyped Google
+- **Baseline lint/type debt:** ruff 9 (7 E501 + 2 UP028), mypy 19 (untyped Google
   client returns, `Returning Any` in thin writers) — pre-existing, concentrated in
-  `google/*` and the thin Graph writers. Verified 2026-09-17.
+  `google/*` and the thin Graph writers. Verified 2026-11-19.
 
 ## Open — Testing
 

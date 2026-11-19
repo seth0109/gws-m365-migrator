@@ -8,7 +8,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from ..state.db import get_folder_dest, session_scope, upsert_folder
-from .graph_client import GRAPH_BASE, GraphClient
+from .graph_client import GraphClient
 
 log = logging.getLogger(__name__)
 
@@ -78,7 +78,8 @@ def ensure_site_for_drive(
             "visibility": "Private",
         }
         if owner:
-            body["owners@odata.bind"] = [f"{GRAPH_BASE}/users/{owner}"]
+            # The bind URL must point at the same cloud the group is created in.
+            body["owners@odata.bind"] = [f"{gc.base_url}/users/{owner}"]
         else:
             log.warning(
                 "Provisioning group %s app-only without an owner — the SharePoint "

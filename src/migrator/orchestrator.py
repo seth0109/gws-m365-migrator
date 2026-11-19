@@ -50,18 +50,12 @@ class Orchestrator:
     # -- destination Graph -------------------------------------------------- #
     def _get_dest_token_provider(self) -> MSTokenProvider:
         if self._dest_token_provider is None:
-            d = self.config.destination
-            self._dest_token_provider = MSTokenProvider(
-                tenant_id=d.tenant_id,
-                client_id=d.client_id,
-                certificate_path=d.certificate_path,
-                certificate_thumbprint=d.certificate_thumbprint,
-                client_secret=d.client_secret,
-                token_cache_file=d.token_cache_file,
-            )
+            self._dest_token_provider = MSTokenProvider.from_config(self.config.destination)
         return self._dest_token_provider
 
     def dest_graph_client(self) -> GraphClient:
+        # The client takes its Graph service root from the token provider, so
+        # each tenant is called on its own cloud (e.g. commercial → GCC High).
         return GraphClient(
             token_provider=self._get_dest_token_provider(),
             per_user_limiter=self._per_user_limiter,
@@ -72,14 +66,7 @@ class Orchestrator:
         if self._source_token_provider is None:
             s = self.config.source
             assert isinstance(s, Microsoft365SourceConfig)
-            self._source_token_provider = MSTokenProvider(
-                tenant_id=s.tenant_id,
-                client_id=s.client_id,
-                certificate_path=s.certificate_path,
-                certificate_thumbprint=s.certificate_thumbprint,
-                client_secret=s.client_secret,
-                token_cache_file=s.token_cache_file,
-            )
+            self._source_token_provider = MSTokenProvider.from_config(s)
         return self._source_token_provider
 
     def source_graph_client(self) -> GraphClient:

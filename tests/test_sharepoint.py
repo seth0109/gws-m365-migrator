@@ -32,6 +32,8 @@ def test_sanitize_mail_nickname_caps_length_and_never_empty() -> None:
 
 
 class _ProvisionGC:
+    base_url = "https://graph.microsoft.com/v1.0"
+
     def __init__(self) -> None:
         self.group_bodies: list[dict[str, Any]] = []
 
@@ -58,6 +60,20 @@ def test_ensure_site_creates_private_group_with_owner(tmp_path: Path) -> None:
     assert body["mailNickname"] == "Finance-Team"
     assert body["owners@odata.bind"] == [
         "https://graph.microsoft.com/v1.0/users/admin@x.com"
+    ]
+
+
+def test_owner_bind_url_uses_the_clients_cloud(tmp_path: Path) -> None:
+    # In GCC High the owner reference must be a graph.microsoft.us URL.
+    init_db(tmp_path / "state.db")
+
+    class _GovGC(_ProvisionGC):
+        base_url = "https://graph.microsoft.us/v1.0"
+
+    gc = _GovGC()
+    ensure_site_for_drive(gc, "gdrive-3", "Finance", "Finance", owner="admin@x.us")  # type: ignore[arg-type]
+    assert gc.group_bodies[0]["owners@odata.bind"] == [
+        "https://graph.microsoft.us/v1.0/users/admin@x.us"
     ]
 
 

@@ -8,6 +8,8 @@ A Python CLI (`migrator`) that migrates mail, files, contacts, and calendars int
 | `imap` | Mail only, from any IMAP server |
 | `microsoft365` | Tenant-to-tenant: mail, OneDrive, contacts, calendar, SharePoint sites |
 
+The destination (and a `microsoft365` source) can be a commercial, **GCC**, **GCC High**, DoD, or 21Vianet tenant; see [GCC High and other national clouds](#gcc-high-and-other-national-clouds). Destination mailboxes can be user mailboxes or [shared mailboxes](#shared-mailboxes).
+
 Every run is **resumable and idempotent**: each migrated item is recorded in a local SQLite state file, so re-running the same command skips finished items and retries failed ones without creating duplicates.
 
 > **Sources are read-only.** Google is accessed with `.readonly` scopes only, IMAP folders are opened read-only, and the source M365 tenant is only ever read.
@@ -85,12 +87,13 @@ Upload `ms-cert.crt` to the app registration (Certificates & secrets) and keep `
 
 `migrator init-config` writes a validated `config.yaml`. It reads the user mapping from a CSV, finds the key PEM (and, for Google, the service-account JSON) in `--credentials-dir` (default `credentials/`), and fills in sensible defaults. It refuses to overwrite an existing file unless you pass `--force`.
 
-**users.csv** — one row per mailbox (start from `users.example.csv`). `source_id` is the identity at the source, `dest_id` the destination UPN. The two IMAP columns are only read for an `imap` source, and a blank `imap_user` means "same as `source_id`":
+**users.csv** — one row per mailbox (start from `users.example.csv`). `source_id` is the identity at the source, `dest_id` the destination UPN. The two IMAP columns are only read for an `imap` source, and a blank `imap_user` means "same as `source_id`". The optional `mailbox_type` column is blank (or `user`) for a normal mailbox and `shared` for a [shared mailbox](#shared-mailboxes):
 
 ```csv
-source_id,dest_id,imap_user,imap_password_env
-alice@old.example,alice@contoso.onmicrosoft.com,alice@old.example,ALICE_IMAP_PW
-bob@old.example,bob@contoso.onmicrosoft.com,bob,BOB_IMAP_PW
+source_id,dest_id,imap_user,imap_password_env,mailbox_type
+alice@old.example,alice@contoso.onmicrosoft.com,alice@old.example,ALICE_IMAP_PW,
+bob@old.example,bob@contoso.onmicrosoft.com,bob,BOB_IMAP_PW,
+info@old.example,info@contoso.onmicrosoft.com,,INFO_IMAP_PW,shared
 ```
 
 ```bash
@@ -108,14 +111,62 @@ migrator init-config -t microsoft365 \
   --tenant-id <dest-tenant-id> --client-id <dest-app-id> --thumbprint <sha1> -m users.csv
 ```
 
+Add `--cloud gcc_high` when the destination tenant is in GCC High (and `--source-cloud` for a `microsoft365` source tenant that is not commercial).
+
 If discovery is ambiguous, point at files explicitly with `--cert`, `--source-cert`, or `--service-account-key`. Prefer hand-editing? `cp config.example.yaml config.yaml`; it documents every field and all three source blocks.
 
 Settings worth a look after scaffolding:
 
+- `destination.cloud` (and `source.cloud` for a `microsoft365` source) — `global` by default; `gcc_high` for GCC High.
+- `users[].mailbox_type` — `shared` for shared mailboxes.
 - `workloads.<name>.enabled` / `concurrency` — turn workloads off or tune parallelism (default 2–4 per workload).
 - `workloads.mail.import_mode` — `json` (default) lands mail as normal, non-draft messages with the original dates; `mime` is byte-perfect but Graph imports it as drafts dated today.
 - `rate_limits.*` — lower these if the destination throttles you.
 - `destination.sharepoint_site_owner` — set it before `shared-drives` or `sharepoint`; app-only groups without an owner may never get a site.
+
+---
+
+## GCC High and other national clouds
+
+Each Microsoft 365 tenant block has a `cloud` setting that selects the sign-in and Graph endpoints. Source and destination are set independently, so a commercial tenant (or Google Workspace, or IMAP) can migrate into GCC High.
+
+| `cloud` | Tenant | Sign-in | Graph |
+|---|---|---|---|
+| `global` (default) | Commercial | `login.microsoftonline.com` | `graph.microsoft.com` |
+| `gcc` | Microsoft 365 GCC | same as `global` | same as `global` |
+| `gcc_high` | GCC High | `login.microsoftonline.us` | `graph.microsoft.us` |
+| `dod` | DoD | `login.microsoftonline.us` | `dod-graph.microsoft.us` |
+| `china` | 21Vianet | `login.chinacloudapi.cn` | `microsoftgraph.chinacloudapi.cn` |
+
+```yaml
+destination:
+  type: microsoft365
+  cloud: gcc_high
+  tenant_id: "..."
+  client_id: "..."
+```
+
+For a GCC High destination:
+
+- Register the app in the **Azure Government** portal (`portal.azure.us`), inside the GCC High tenant. The application permissions are the same as in the table above. A token from one cloud is never valid in another, so a commercial app registration cannot be reused.
+- SharePoint addresses end in `.sharepoint.us` (for example `dest_site: "contoso.sharepoint.us:/sites/Marketing"`).
+- `migrator smoke-test` prints the cloud and Graph endpoint it is calling. Run it, then one pilot user (`migrator run-all -u <source_id>`), before a full run. The routing is covered by tests and both `.us` endpoints answer, but this tool has not been run against a live GCC High tenant yet.
+
+## Shared mailboxes
+
+Map a shared mailbox like a user and mark it `mailbox_type: shared` (or `shared` in the `mailbox_type` CSV column):
+
+```yaml
+users:
+  - source_id: info@old.example
+    dest_id: info@contoso.onmicrosoft.com
+    mailbox_type: shared
+```
+
+- **Create the shared mailbox first** in the Exchange admin center or with `New-Mailbox -Shared`. The tool writes into existing mailboxes; it does not create them. `dest_id` is the mailbox's UPN.
+- **Mail, contacts, and calendar** migrate exactly as for a user. The app permissions already cover shared mailboxes, unless an Exchange application access policy restricts the app to specific mailboxes; in that case add the shared mailbox to its scope.
+- **Files are skipped** for the mapping, with a warning in the log. A shared mailbox has no license and therefore no OneDrive. If the source account behind it owns Drive files, they stay at the source; move them through a regular user mapping or a Shared Drive → SharePoint mapping.
+- An unlicensed shared mailbox is capped at 50 GB by Exchange Online. Check the size of the source mailbox before migrating into one.
 
 ---
 
@@ -221,7 +272,7 @@ Per-user commands take `--user/-u <source_id>`; `--user` that matches no configu
 
 ```bash
 pip install -e ".[dev]"
-pytest                # 200+ tests, no network
+pytest                # 240+ tests, no network
 ruff check src/       # lint (E, F, I, UP); line length 100
 mypy src/             # strict
 ```

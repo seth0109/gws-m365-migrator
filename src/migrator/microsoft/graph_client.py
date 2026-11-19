@@ -17,6 +17,9 @@ from ..ratelimit import PerUserRateLimiter, registry
 
 log = logging.getLogger(__name__)
 
+# Global-cloud service root: the default when a client is built without a
+# cloud-aware token provider. National clouds (GCC High, DoD, China) use another
+# host — never build a URL from this constant, go through GraphClient instead.
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 _MAX_RETRIES = 7
 
@@ -69,7 +72,15 @@ def _wait(retry_state: Any) -> float:
 
 
 class GraphClient:
-    """Thin httpx wrapper: auth injection, tenacity retry, 429/Retry-After, rate limiting."""
+    """Thin httpx wrapper: auth injection, tenacity retry, 429/Retry-After, rate limiting.
+
+    Every method takes a Graph-relative path ("/users/...") and resolves it
+    against this client's service root, so the same writers serve the global
+    cloud and the national clouds. Absolute URLs (nextLink, deltaLink, uploadUrl)
+    are sent as-is."""
+
+    # Class-level default so a client built without __init__ still has a root.
+    _base: str = GRAPH_BASE
 
     def __init__(
         self,
@@ -77,12 +88,28 @@ class GraphClient:
         global_limiter_name: str = "graph_global",
         per_user_limiter: PerUserRateLimiter | None = None,
         timeout: float = 60.0,
+        base_url: str | None = None,
     ) -> None:
         self._token_provider = token_provider
         self._global_limiter_name = global_limiter_name
         self._per_user_limiter = per_user_limiter
         self._timeout = timeout
         self._client = httpx.Client(timeout=timeout)
+        # A token is only valid for the cloud that issued it, so the service
+        # root follows the token provider unless a caller pins one explicitly.
+        if base_url is None:
+            base_url = str(getattr(token_provider, "graph_base", GRAPH_BASE))
+        self._base = base_url.rstrip("/")
+
+    @property
+    def base_url(self) -> str:
+        """Service root incl. version, e.g. "https://graph.microsoft.us/v1.0"."""
+        return self._base
+
+    def _url(self, path: str) -> str:
+        if path.startswith(("https://", "http://")):
+            return path
+        return f"{self._base}{path}"
 
     def _reset_transport(self) -> None:
         """Drop all pooled connections and start a fresh client.
@@ -128,8 +155,9 @@ class GraphClient:
         quiet_statuses: tuple[int, ...] = tuple(kwargs.pop("quiet_statuses", ()))
         # Upload-session URLs (uploadUrl) are pre-authenticated; the Graph docs
         # direct apps NOT to send Authorization on those PUTs (it can 401).
-        # Only requests to the Graph host get the bearer token + JSON default.
-        is_graph = url.startswith(GRAPH_BASE)
+        # Only requests to this client's Graph host get the bearer token + JSON
+        # default (upload hosts differ per cloud: *.sharepoint.com / .us, ...).
+        is_graph = url.startswith(self._base)
 
         def _redial(retry_state: Any) -> None:
             # A 429 is the server's answer over a healthy socket — keep the pool.
@@ -187,35 +215,36 @@ class GraphClient:
         return _do()
 
     def get(self, path: str, user_key: str | None = None, **kwargs: Any) -> Any:
-        resp = self._request("GET", f"{GRAPH_BASE}{path}", user_key=user_key, **kwargs)
+        resp = self._request("GET", self._url(path), user_key=user_key, **kwargs)
         return resp.json()
 
     def get_bytes(self, path: str, user_key: str | None = None, **kwargs: Any) -> bytes:
         """GET raw response bytes (e.g. message MIME via /$value, file /content)."""
-        resp = self._request("GET", f"{GRAPH_BASE}{path}", user_key=user_key, **kwargs)
+        resp = self._request("GET", self._url(path), user_key=user_key, **kwargs)
         return resp.content
 
     def post(self, path: str, user_key: str | None = None, **kwargs: Any) -> Any:
-        resp = self._request("POST", f"{GRAPH_BASE}{path}", user_key=user_key, **kwargs)
+        resp = self._request("POST", self._url(path), user_key=user_key, **kwargs)
         if resp.content:
             return resp.json()
         return None
 
     def patch(self, path: str, user_key: str | None = None, **kwargs: Any) -> Any:
-        resp = self._request("PATCH", f"{GRAPH_BASE}{path}", user_key=user_key, **kwargs)
+        resp = self._request("PATCH", self._url(path), user_key=user_key, **kwargs)
         if resp.content:
             return resp.json()
         return None
 
     def delete(self, path: str, user_key: str | None = None, **kwargs: Any) -> None:
-        self._request("DELETE", f"{GRAPH_BASE}{path}", user_key=user_key, **kwargs)
+        self._request("DELETE", self._url(path), user_key=user_key, **kwargs)
 
     def put_raw(self, url: str, data: bytes, user_key: str | None = None, **kwargs: Any) -> Any:
-        """Used for chunked upload sessions (absolute URL, not path-relative).
+        """PUT raw bytes to a Graph-relative path (simple upload, contact photo)
+        or to the absolute pre-authenticated `uploadUrl` of an upload session.
 
         Routed through _request so chunk PUTs get rate limiting, tenacity retry,
         and 429/Retry-After handling — the throttle-prone large-upload path."""
-        resp = self._request("PUT", url, user_key=user_key, content=data, **kwargs)
+        resp = self._request("PUT", self._url(url), user_key=user_key, content=data, **kwargs)
         if resp.content:
             return resp.json()
         return None
@@ -224,7 +253,7 @@ class GraphClient:
         self, path: str, user_key: str | None = None, **kwargs: Any
     ) -> Iterator[list[dict[str, Any]]]:
         """Yield pages from a Graph collection, following @odata.nextLink."""
-        url: str | None = f"{GRAPH_BASE}{path}"
+        url: str | None = path
         first = True
         while url:
             kw = kwargs
@@ -232,11 +261,7 @@ class GraphClient:
                 # nextLink already embeds the query ($top, skiptoken, ...) —
                 # re-sending the original params would duplicate them.
                 kw = {k: v for k, v in kwargs.items() if k != "params"}
-            if url.startswith(GRAPH_BASE):
-                data = self.get(url[len(GRAPH_BASE):], user_key=user_key, **kw)
-            else:
-                resp = self._request("GET", url, user_key=user_key, **kw)
-                data = resp.json()
+            data = self.get(url, user_key=user_key, **kw)
             yield data.get("value", [])
             url = data.get("@odata.nextLink")
             first = False

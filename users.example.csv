@@ -1,3 +1,4 @@
-source_id,dest_id,imap_user,imap_password_env
-alice@old.example,alice@contoso.onmicrosoft.com,alice@old.example,ALICE_IMAP_PW
-bob@old.example,bob@contoso.onmicrosoft.com,,BOB_IMAP_PW
+source_id,dest_id,imap_user,imap_password_env,mailbox_type
+alice@old.example,alice@contoso.onmicrosoft.com,alice@old.example,ALICE_IMAP_PW,
+bob@old.example,bob@contoso.onmicrosoft.com,,BOB_IMAP_PW,
+info@old.example,info@contoso.onmicrosoft.com,,INFO_IMAP_PW,shared

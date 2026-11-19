@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, NamedTuple
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field
 
 _GOOGLE_READONLY_SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -13,6 +13,46 @@ _GOOGLE_READONLY_SCOPES = [
     "https://www.googleapis.com/auth/contacts.readonly",
     "https://www.googleapis.com/auth/calendar.readonly",
 ]
+
+
+def normalize_token(value: object) -> object:
+    """Accept "GCC High" / "gcc-high" / "Shared" for the enum-like fields."""
+    if isinstance(value, str):
+        return value.strip().lower().replace("-", "_").replace(" ", "_")
+    return value
+
+
+# --------------------------------------------------------------------------- #
+# Microsoft national clouds
+# --------------------------------------------------------------------------- #
+# Each Microsoft 365 tenant block names the cloud its tenant lives in — source
+# and destination independently, so a commercial tenant can migrate into GCC
+# High. Tokens are not interchangeable between clouds, so the sign-in authority,
+# the token scope and the Graph service root must all come from the same row.
+# Endpoints per https://learn.microsoft.com/graph/deployments. Microsoft 365 GCC
+# (not High) is served by the global endpoints; "gcc" exists so that is explicit.
+M365Cloud = Annotated[
+    Literal["global", "gcc", "gcc_high", "dod", "china"],
+    BeforeValidator(normalize_token),
+]
+
+
+class CloudEndpoints(NamedTuple):
+    login: str  # Microsoft Entra ID authority host
+    graph: str  # Microsoft Graph service root (no version segment)
+
+
+_GLOBAL = CloudEndpoints("https://login.microsoftonline.com", "https://graph.microsoft.com")
+
+CLOUD_ENDPOINTS: dict[str, CloudEndpoints] = {
+    "global": _GLOBAL,
+    "gcc": _GLOBAL,
+    "gcc_high": CloudEndpoints("https://login.microsoftonline.us", "https://graph.microsoft.us"),
+    "dod": CloudEndpoints("https://login.microsoftonline.us", "https://dod-graph.microsoft.us"),
+    "china": CloudEndpoints(
+        "https://login.chinacloudapi.cn", "https://microsoftgraph.chinacloudapi.cn"
+    ),
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -38,6 +78,7 @@ class Microsoft365SourceConfig(BaseModel):
     type: Literal["microsoft365"] = "microsoft365"
     tenant_id: str
     client_id: str
+    cloud: M365Cloud = "global"  # national cloud of the SOURCE tenant
     certificate_path: Path | None = None
     certificate_thumbprint: str | None = None
     client_secret: str | None = None
@@ -62,6 +103,7 @@ class Microsoft365DestinationConfig(BaseModel):
     type: Literal["microsoft365"] = "microsoft365"
     tenant_id: str
     client_id: str
+    cloud: M365Cloud = "global"  # national cloud of the DESTINATION tenant
     certificate_path: Path | None = None
     certificate_thumbprint: str | None = None
     client_secret: str | None = None
@@ -83,6 +125,14 @@ DestinationConfig = Microsoft365DestinationConfig
 class UserMapping(BaseModel):
     source_id: str  # source identity (Google email / IMAP address / source-tenant UPN)
     dest_id: str  # destination Microsoft 365 UPN
+
+    # "shared" = the destination is a shared mailbox. Graph addresses it like any
+    # other mailbox (/users/{upn}), so mail, contacts and calendar migrate
+    # unchanged — but a shared mailbox is an unlicensed account with no OneDrive,
+    # so the files workload is skipped for this mapping.
+    mailbox_type: Annotated[
+        Literal["user", "shared"], BeforeValidator(normalize_token)
+    ] = "user"
 
     # IMAP source only — per-user credentials. Prefer imap_password_env (reads the
     # secret from an environment variable) over the inline imap_password.

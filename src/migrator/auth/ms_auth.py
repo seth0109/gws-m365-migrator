@@ -5,11 +5,20 @@ from pathlib import Path
 
 import msal
 
-_GRAPH_SCOPE = ["https://graph.microsoft.com/.default"]
+from ..config import (
+    CLOUD_ENDPOINTS,
+    Microsoft365DestinationConfig,
+    Microsoft365SourceConfig,
+)
 
 
 class MSTokenProvider:
-    """Thread-safe MSAL confidential-client token provider with disk cache."""
+    """Thread-safe MSAL confidential-client token provider with disk cache.
+
+    `cloud` selects the national cloud (see `config.CLOUD_ENDPOINTS`): it sets
+    the sign-in authority and the token scope, and `graph_base` exposes the
+    matching Graph service root so a GraphClient built on this provider calls
+    the cloud its token is valid for."""
 
     def __init__(
         self,
@@ -19,6 +28,7 @@ class MSTokenProvider:
         certificate_thumbprint: str | None = None,
         client_secret: str | None = None,
         token_cache_file: Path | None = None,
+        cloud: str = "global",
     ) -> None:
         self._lock = threading.Lock()
         self._cache = msal.SerializableTokenCache()
@@ -28,7 +38,10 @@ class MSTokenProvider:
 
         self._token_cache_file = token_cache_file
 
-        authority = f"https://login.microsoftonline.com/{tenant_id}"
+        endpoints = CLOUD_ENDPOINTS[cloud]
+        self.graph_base = f"{endpoints.graph}/v1.0"
+        self._scope = [f"{endpoints.graph}/.default"]
+        authority = f"{endpoints.login}/{tenant_id}"
 
         if certificate_path and certificate_thumbprint:
             cert_data = certificate_path.read_bytes()
@@ -49,19 +62,36 @@ class MSTokenProvider:
                 token_cache=self._cache,
             )
         else:
-            raise ValueError("Provide either (certificate_path + certificate_thumbprint) or client_secret")
+            raise ValueError(
+                "Provide either (certificate_path + certificate_thumbprint) or client_secret"
+            )
+
+    @classmethod
+    def from_config(
+        cls, cfg: Microsoft365SourceConfig | Microsoft365DestinationConfig
+    ) -> MSTokenProvider:
+        """Build the provider for one tenant block (source or destination)."""
+        return cls(
+            tenant_id=cfg.tenant_id,
+            client_id=cfg.client_id,
+            certificate_path=cfg.certificate_path,
+            certificate_thumbprint=cfg.certificate_thumbprint,
+            client_secret=cfg.client_secret,
+            token_cache_file=cfg.token_cache_file,
+            cloud=cfg.cloud,
+        )
 
     def get_token(self) -> str:
         with self._lock:
-            result = self._app.acquire_token_silent(_GRAPH_SCOPE, account=None)
+            result = self._app.acquire_token_silent(self._scope, account=None)
             if not result:
-                result = self._app.acquire_token_for_client(_GRAPH_SCOPE)
+                result = self._app.acquire_token_for_client(self._scope)
             if "access_token" not in result:
                 raise RuntimeError(
                     f"Failed to acquire MS token: {result.get('error_description', result)}"
                 )
             self._persist_cache()
-            return result["access_token"]
+            return str(result["access_token"])
 
     def _persist_cache(self) -> None:
         if self._token_cache_file and self._cache.has_state_changed:

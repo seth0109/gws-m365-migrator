@@ -37,10 +37,13 @@ def generate_report(cfg: Config, output_path: Path) -> None:
         }
         # Union with the standard per-user workloads so a configured user whose
         # workload produced no rows still surfaces (a possible data-loss signal).
+        # A shared mailbox has no OneDrive, so `files` never runs for it: an
+        # all-zero files row there would read as a workload that was missed.
         expected = {
             (user.source_id, workload)
             for user in cfg.users
             for workload in _STANDARD_WORKLOADS
+            if not (workload == "files" and user.mailbox_type == "shared")
         }
 
         for user_email, workload in sorted(observed | expected):

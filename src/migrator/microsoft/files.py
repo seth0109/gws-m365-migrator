@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import logging
 import time
+from urllib.parse import quote
 
 import httpx
 
-from .graph_client import GRAPH_BASE, GraphClient
+from .graph_client import GraphClient
 
 log = logging.getLogger(__name__)
 
@@ -56,8 +57,18 @@ def ensure_onedrive(gc: GraphClient, ms_user_id: str) -> None:
     raise RuntimeError(
         f"OneDrive for user {ms_user_id} is not provisioned and did not come online "
         "within the wait window. Pre-provision it (SharePoint admin: "
-        "Request-SPOPersonalSite, or have the user sign in to OneDrive once) and re-run."
+        "Request-SPOPersonalSite, or have the user sign in to OneDrive once) and re-run. "
+        "If this destination is a shared mailbox it has no OneDrive at all — set "
+        "mailbox_type: shared on its users[] entry so the files workload skips it."
     )
+
+
+def _name_segment(file_name: str) -> str:
+    """Percent-encode a file name for path-based addressing (`:/{name}:`).
+
+    OneDrive allows `#` and `%` in names; left raw, `#` starts a URL fragment
+    and silently truncates both the name and the `:/content` suffix."""
+    return quote(file_name, safe="")
 
 # `drive_root` is the full Graph path prefix to a drive, without a leading slash:
 #   - OneDrive:   "users/<user-id>/drive"
@@ -127,7 +138,7 @@ def upload_small_file(
 ) -> str:
     # Simple upload is PUT-only (docs: driveitem-put-content); POST returns 405.
     result = gc.put_raw(
-        f"{GRAPH_BASE}/{drive_root}/items/{parent_id}:/{file_name}:/content",
+        f"/{drive_root}/items/{parent_id}:/{_name_segment(file_name)}:/content",
         data=content,
         user_key=user_key,
         headers={"Content-Type": "application/octet-stream"},
@@ -145,7 +156,7 @@ def upload_large_file(
 ) -> str:
     """Chunked upload session for files that may be large."""
     session = gc.post(
-        f"/{drive_root}/items/{parent_id}:/{file_name}:/createUploadSession",
+        f"/{drive_root}/items/{parent_id}:/{_name_segment(file_name)}:/createUploadSession",
         user_key=user_key,
         json={"item": {"@microsoft.graph.conflictBehavior": "rename"}},
     )
@@ -177,7 +188,7 @@ def update_file_content(
 ) -> None:
     """Replace the content of an existing driveItem in-place (delta updates)."""
     if len(content) <= _CHUNK_SIZE:
-        url = f"{GRAPH_BASE}/{drive_root}/items/{dest_id}/content"
+        url = f"/{drive_root}/items/{dest_id}/content"
         gc.put_raw(
             url, data=content, user_key=user_key,
             headers={"Content-Type": "application/octet-stream"},

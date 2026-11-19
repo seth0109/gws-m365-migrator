@@ -242,3 +242,84 @@ def test_build_unknown_source_type_raises(tmp_path: Path) -> None:
             dest_client_id="c",
             dest_thumbprint="x",
         )
+
+
+# --------------------------------------------------------------------------- #
+# National cloud + shared-mailbox scaffolding
+# --------------------------------------------------------------------------- #
+def test_build_writes_destination_cloud(tmp_path: Path) -> None:
+    cfg = build_config_dict(
+        source_type="imap",
+        creds=_creds(tmp_path),
+        users=[{"source_id": "a@old.com", "dest_id": "a@new.us"}],
+        dest_tenant_id="t",
+        dest_client_id="c",
+        dest_thumbprint="x",
+        imap_host="imap.old.com",
+        dest_cloud="GCC High",
+    )
+    assert cfg["destination"]["cloud"] == "gcc_high"  # type: ignore[index]
+    assert Config.model_validate(cfg).destination.cloud == "gcc_high"
+    assert "cloud: gcc_high" in dump_config_yaml(cfg)
+
+
+def test_build_m365_source_and_destination_clouds_are_independent(tmp_path: Path) -> None:
+    cfg = build_config_dict(
+        source_type="microsoft365",
+        creds=_creds(tmp_path, src=True),
+        users=[{"source_id": "a@src.com", "dest_id": "a@dst.us"}],
+        dest_tenant_id="t",
+        dest_client_id="c",
+        dest_thumbprint="x",
+        source_tenant_id="st",
+        source_client_id="sc",
+        source_thumbprint="sx",
+        dest_cloud="gcc_high",
+    )
+    model = Config.model_validate(cfg)
+    assert model.source.type == "microsoft365" and model.source.cloud == "global"
+    assert model.destination.cloud == "gcc_high"
+
+
+def test_build_unknown_cloud_raises(tmp_path: Path) -> None:
+    with pytest.raises(ConfigGenError, match="--cloud"):
+        build_config_dict(
+            source_type="imap",
+            creds=_creds(tmp_path),
+            users=[{"source_id": "a", "dest_id": "b"}],
+            dest_tenant_id="t",
+            dest_client_id="c",
+            dest_thumbprint="x",
+            imap_host="h",
+            dest_cloud="gcchigh",
+        )
+
+
+def test_parse_mapping_mailbox_type_column(tmp_path: Path) -> None:
+    csv_path = tmp_path / "users.csv"
+    csv_path.write_text(
+        "source_id,dest_id,mailbox_type\n"
+        "a@old.com,a@new.com,\n"            # blank -> default user mailbox
+        "b@old.com,b@new.com,user\n"        # explicit default is not written
+        "info@old.com,info@new.com,Shared\n"
+    )
+    users = parse_mapping_csv(csv_path)
+    assert users == [
+        {"source_id": "a@old.com", "dest_id": "a@new.com"},
+        {"source_id": "b@old.com", "dest_id": "b@new.com"},
+        {"source_id": "info@old.com", "dest_id": "info@new.com", "mailbox_type": "shared"},
+    ]
+    cfg = build_config_dict(
+        source_type="imap", creds=_creds(tmp_path), users=users,
+        dest_tenant_id="t", dest_client_id="c", dest_thumbprint="x", imap_host="h",
+    )
+    assert [u.mailbox_type for u in Config.model_validate(cfg).users] == [
+        "user", "user", "shared",
+    ]
+
+
+def test_parse_mapping_bad_mailbox_type_names_the_line(tmp_path: Path) -> None:
+    csv_path = tmp_path / "users.csv"
+    csv_path.write_text("source_id,dest_id,mailbox_type\na@old.com,a@new.com,room\n")
+    with pytest.raises(ConfigGenError, match="line 2: mailbox_type"):
+        parse_mapping_csv(csv_path)

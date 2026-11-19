@@ -323,6 +323,17 @@ def init_config(
         str | None,
         typer.Option("--source-thumbprint", help="[microsoft365] source certificate thumbprint"),
     ] = None,
+    # National cloud of each tenant (GCC uses the global endpoints).
+    cloud: Annotated[
+        str,
+        typer.Option(
+            "--cloud", help="Destination tenant cloud: global | gcc | gcc_high | dod | china"
+        ),
+    ] = "global",
+    source_cloud: Annotated[
+        str,
+        typer.Option("--source-cloud", help="[microsoft365] source tenant cloud (same values)"),
+    ] = "global",
     # Explicit credential overrides (resolve ambiguity in --credentials-dir).
     service_account_key: Annotated[
         Path | None, typer.Option("--service-account-key", help="Override discovered JSON key")
@@ -383,6 +394,8 @@ def init_config(
             source_tenant_id=source_tenant_id,
             source_client_id=source_client_id,
             source_thumbprint=source_thumbprint,
+            dest_cloud=cloud,
+            source_cloud=source_cloud,
         )
     except ConfigGenError as exc:
         console.print(f"[red]{exc}")
@@ -425,7 +438,8 @@ def smoke_test(
         raise typer.Exit(1)
 
     pilot = cfg.users[0]
-    console.print(f"[bold]Smoke test: pilot user = {pilot.source_id} → {pilot.dest_id}")
+    kind = " (shared mailbox)" if pilot.mailbox_type == "shared" else ""
+    console.print(f"[bold]Smoke test: pilot user = {pilot.source_id} → {pilot.dest_id}{kind}")
 
     _probe_source(cfg, pilot)
     _probe_destination(cfg, pilot)
@@ -478,16 +492,9 @@ def _probe_destination(cfg: Config, pilot: UserMapping) -> None:
     from .auth.ms_auth import MSTokenProvider
     from .microsoft.graph_client import GraphClient
 
-    d = cfg.destination
-    tp = MSTokenProvider(
-        tenant_id=d.tenant_id,
-        client_id=d.client_id,
-        certificate_path=d.certificate_path,
-        certificate_thumbprint=d.certificate_thumbprint,
-        client_secret=d.client_secret,
-        token_cache_file=d.token_cache_file,
-    )
+    tp = MSTokenProvider.from_config(cfg.destination)
     with GraphClient(tp) as gc:
+        console.print(f"[dim]Destination cloud: {cfg.destination.cloud} ({gc.base_url})")
         user_info = gc.get(f"/users/{pilot.dest_id}")
         ms_id = user_info["id"]
         folder = gc.post(

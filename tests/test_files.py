@@ -20,8 +20,10 @@ from migrator.microsoft.files import (
     _is_mysite_missing,
     ensure_folder,
     ensure_onedrive,
+    upload_large_file,
     upload_small_file,
 )
+from migrator.microsoft.graph_client import GraphClient
 
 
 def _resp(code: int, text: str = "") -> httpx.Response:
@@ -79,6 +81,12 @@ def test_ensure_onedrive_raises_clear_error_if_never_provisioned() -> None:
     gc = _FakeGC(fail_times=999)
     with pytest.raises(RuntimeError, match="not provisioned"):
         ensure_onedrive(gc, "user-id")  # type: ignore[arg-type]
+
+
+def test_never_provisioned_error_points_at_the_shared_mailbox_setting() -> None:
+    # The usual cause of a OneDrive that never appears is an unflagged shared mailbox.
+    with pytest.raises(RuntimeError, match="mailbox_type: shared"):
+        ensure_onedrive(_FakeGC(fail_times=999), "user-id")  # type: ignore[arg-type]
 
 
 def test_ensure_onedrive_reraises_unrelated_errors() -> None:
@@ -174,3 +182,48 @@ def test_upload_small_file_uses_put() -> None:
     url, data = gc.put_calls[0]
     assert url.endswith("/users/u/drive/items/p1:/a.txt:/content")
     assert data == b"data"
+
+
+# ── file names in path-based addressing (real client, fake transport) ────────
+
+
+class _Tokens:
+    def get_token(self) -> str:
+        return "tok"
+
+
+def _recording_client(seen: list[httpx.Request]) -> GraphClient:
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        if req.url.path.endswith("createUploadSession"):
+            return httpx.Response(200, json={"uploadUrl": "https://up.example.com/s1"})
+        return httpx.Response(201, json={"id": "new-item"})
+
+    gc = GraphClient(_Tokens())  # type: ignore[arg-type]
+    gc._client.close()
+    gc._client = httpx.Client(transport=httpx.MockTransport(handler))
+    return gc
+
+
+def test_small_upload_encodes_hash_and_percent_in_the_name() -> None:
+    # OneDrive allows "#" and "%" in names (an M365 source passes them through).
+    # Unencoded, "#" starts a URL fragment: the request would go to
+    # ".../items/p1:/Q3 " and never reach ":/content".
+    seen: list[httpx.Request] = []
+    gc = _recording_client(seen)
+    assert upload_small_file(gc, "users/u/drive", "u", "p1", "Q3 #50%.pdf", b"x") == "new-item"
+    assert seen[0].method == "PUT"
+    assert seen[0].url.raw_path == b"/v1.0/users/u/drive/items/p1:/Q3%20%2350%25.pdf:/content"
+    assert seen[0].url.fragment == ""
+
+
+def test_large_upload_session_encodes_the_name_too() -> None:
+    seen: list[httpx.Request] = []
+    gc = _recording_client(seen)
+    upload_large_file(gc, "drives/D1", "D1", "p1", "notes #1?.txt", b"x")
+    assert seen[0].url.raw_path == (
+        b"/v1.0/drives/D1/items/p1:/notes%20%231%3F.txt:/createUploadSession"
+    )
+    # The chunk goes to the pre-authenticated upload host without a bearer token.
+    assert seen[1].url.host == "up.example.com"
+    assert "Authorization" not in seen[1].headers

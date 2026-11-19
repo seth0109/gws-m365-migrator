@@ -73,6 +73,17 @@ def run_files(ctx: JobContext) -> None:
     ctx.require_capability("files")
     user = ctx.user
 
+    if user.mailbox_type == "shared":
+        # A shared mailbox is an unlicensed account: it has no OneDrive to write
+        # to (and, tenant-to-tenant, none to read from). Skip in every mode
+        # rather than stall in ensure_onedrive and fail the user's run.
+        log.warning(
+            "%s → %s is a shared mailbox (no OneDrive) — files workload skipped. Drive "
+            "files owned by the source account are NOT migrated by this mapping.",
+            user.source_id, user.dest_id,
+        )
+        return
+
     if ctx.mode == "whatif":
         _whatif_files(ctx)
         return

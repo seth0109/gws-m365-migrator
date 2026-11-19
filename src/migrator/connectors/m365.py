@@ -33,8 +33,6 @@ _EVENT_FIELDS = (
 )
 
 
-_GRAPH_BASE = "https://graph.microsoft.com/v1.0"
-
 log = logging.getLogger(__name__)
 
 # Graph wellKnownName → canonical token shared with the destination writer
@@ -48,11 +46,6 @@ _WELLKNOWN_TO_TOKEN = {
     "junkemail": "JunkEmail",
     "archive": "Archive",
 }
-
-
-def _strip_base(url: str) -> str:
-    """Turn an absolute Graph URL (next/deltaLink) into a path GraphClient accepts."""
-    return url[len(_GRAPH_BASE):] if url.startswith(_GRAPH_BASE) else url
 
 
 def _now_z() -> str:
@@ -191,7 +184,10 @@ class M365Source(BaseSource):
         (e.g. "users/<id>/drive" or "drives/<id>"); it is stamped on each SourceFile
         so fetch_file knows where to read content from."""
         gc = self._client()
-        url: str | None = _strip_base(since) if since else f"/{drive_root}/root/delta"
+        # `since` is the absolute deltaLink stored by the previous pass; next and
+        # delta links carry the source cloud's own host, and GraphClient sends
+        # absolute URLs as-is (authenticated when they are on its service root).
+        url: str | None = since or f"/{drive_root}/root/delta"
         delta_link: str | None = None
         while url:
             data = gc.get(url, user_key=user_key)
@@ -203,9 +199,8 @@ class M365Source(BaseSource):
                     # name/file/folder); there is nothing to migrate for them.
                     continue
                 yield self._to_file(item, drive_root)
-            next_link = data.get("@odata.nextLink")
             delta_link = data.get("@odata.deltaLink") or delta_link
-            url = _strip_base(next_link) if next_link else None
+            url = data.get("@odata.nextLink")
         if delta_link:
             self._set_cursor(cursor_key, delta_link)
 

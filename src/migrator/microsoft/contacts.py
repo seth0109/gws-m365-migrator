@@ -5,7 +5,7 @@ from typing import Any
 
 import httpx
 
-from .graph_client import GRAPH_BASE, GraphClient
+from .graph_client import GraphClient
 
 log = logging.getLogger(__name__)
 
@@ -85,7 +85,7 @@ def delete_contact(gc: GraphClient, ms_user_id: str, contact_id: str) -> None:
 def set_contact_photo(gc: GraphClient, ms_user_id: str, contact_id: str, data: bytes) -> None:
     """PUT the contact's photo (Graph stores/converts it; JPEG is canonical)."""
     gc.put_raw(
-        f"{GRAPH_BASE}/users/{ms_user_id}/contacts/{contact_id}/photo/$value",
+        f"/users/{ms_user_id}/contacts/{contact_id}/photo/$value",
         data=data,
         user_key=ms_user_id,
         headers={"Content-Type": "image/jpeg"},
