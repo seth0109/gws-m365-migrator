@@ -36,6 +36,21 @@ This file is the single source of truth for the backlog (`CLAUDE.md` points here
   candidate. A missing file reports the absolute path tried, and both cases
   list the private keys that are in the folder; `smoke-test` prints the
   message without a traceback.
+- **Delta passes made dependable (M365 source audit before the first pilot).**
+  - *Stable source ids.* The source client sends `Prefer:
+    IdType="ImmutableId"` (`source.immutable_ids`, default true). Regular
+    Outlook ids change when an item is moved between folders, so a migrated
+    message the user filed elsewhere was imported again by the next pass.
+  - *A delta with no cursor fails the run* (`NoDeltaCursor`, exit 1) instead
+    of warning and exiting 0 with new items left behind.
+  - *A failed item no longer blocks deltas forever.* The first full pass seeds
+    the cursor even with failures (they are behind any cursor and only a full
+    re-run retries them); an existing cursor is still held on failure. A clean
+    run reports `failed` rows left by earlier runs.
+  - *Clock skew.* Timestamp deltas (mail/contacts/calendar) re-read 10 minutes
+    before the cursor.
+  - *Cheap re-runs.* M365 message bodies load lazily, after the idempotency
+    check, so a full re-run no longer downloads the whole mailbox to skip it.
 - **M365 source mail no longer 400s on the folder listing.** The connector
   selected `wellKnownName`, which exists only on the beta `mailFolder`; on
   v1.0 the request is a 400, so the first live tenant-to-tenant mail run (and
@@ -183,17 +198,49 @@ This file is the single source of truth for the backlog (`CLAUDE.md` points here
   is the intended single placement. Whatif notes ("folders: Inbox+1 more") make
   the current behaviour visible.
 
-- **Mail delta adds new messages only.** Read/flag/label changes to an
-  already-migrated message are never applied (Gmail history is enumerated for
-  `messageAdded`; M365 filters on `receivedDateTime`). Contacts/calendar/files
-  now update in place; mail does not.
+- **Mail delta adds new messages only.** Read/flag/label changes, moves
+  between folders and deletions of an already-migrated message are never
+  applied (Gmail history is enumerated for `messageAdded`; M365 filters on
+  `receivedDateTime`). Contacts/calendar/files now update in place; mail does
+  not. After a long gap between the full pass and cutover, users see mail they
+  had read, filed or deleted back in its old state.
 
-- **Timestamp-based delta for mail/contacts/calendar (M365 source) is lossy.**
-  Only files use real Graph delta tokens; the M365 connector sets the cursor to
-  "now" and filters on `receivedDateTime`/`lastModifiedDateTime ge since`,
-  missing folder moves and flag changes, and clock-skew sensitive.
-  **Change adds:** proper Graph delta queries (`/messages/delta`,
-  `/contacts/delta`, `/events/delta`).
+- **Timestamp-based delta for mail/contacts/calendar (M365 source) is
+  adds-and-edits only.** Only files use real Graph delta tokens; the M365
+  connector sets the cursor to "now" and filters on
+  `receivedDateTime`/`lastModifiedDateTime ge since` (with a 10-minute overlap
+  for clock skew). It therefore never sees: deletions of contacts or events
+  (they stay at the destination), a message that entered the mailbox with an
+  old received date (import, move in from an archive or another mailbox), or
+  — for mail — any change to an already-migrated message. The listing is
+  offset-paged, so a hard delete during a pass can shift one other item past a
+  page boundary; a full re-run picks it up. **Change adds:** proper Graph delta
+  queries (`/mailFolders/{id}/messages/delta`, `/contacts/delta`,
+  `/events/delta`) with `@removed` handling, and — for mail — replaying
+  read/flag changes, moves and deletions onto the migrated copy.
+
+- **Files delta does not replay renames, moves or deletions (M365 source).**
+  `_iter_drive` drops `deleted` tombstones; a re-emitted file whose hash is
+  unchanged is skipped, so a rename or move is not applied; a renamed *folder*
+  is re-created under its new name by `ensure_folder` while its earlier
+  children stay in the old one. **Change adds:** PATCH name/parentReference on
+  the recorded destination item for a re-emitted known item; optional delete
+  propagation.
+
+- **A destination copy deleted or moved by the user stalls its delta.**
+  Contacts/events are PATCHed by the recorded `dest_id`; if that item is gone
+  the PATCH 404s, the item is marked failed and the cursor is held on every
+  later delta. **Change adds:** treat a 404 on update as "re-create or skip",
+  and consider immutable ids on the destination client too.
+
+- **Gmail and IMAP still download a message before the idempotency check.**
+  Only the M365 connector uses the lazy `SourceMessage.load_mime`.
+  **Change adds:** the same for `connectors/google.py` and `connectors/imap.py`.
+
+- **Tenant-level flows still skip quietly without a cursor.** `shared-drives
+  --delta` / `sharepoint --delta` warn and continue (exit 0) for a drive or
+  site with no cursor, and still gate cursor seeding on zero failures.
+  **Change adds:** route them through `workloads/cursors.py`.
 
 - **JSON mail import re-encodes the body.** The default `import_mode: json`
   parses MIME and rebuilds body/attachments — not byte-perfect (S/MIME,

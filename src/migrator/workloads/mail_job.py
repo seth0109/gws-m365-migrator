@@ -10,7 +10,8 @@ from ..microsoft.mail import (
     patch_message_flags,
     resolve_folder_segment,
 )
-from ..state.db import get_cursor, is_done, save_cursor, session_scope, upsert_folder, upsert_item
+from ..state.db import is_done, session_scope, upsert_folder, upsert_item
+from .cursors import advance_cursor, delta_since
 
 log = logging.getLogger(__name__)
 
@@ -26,18 +27,12 @@ def run_mail(ctx: JobContext) -> None:
     gc = ctx.dest_gc
     assert gc is not None, "GraphClient required outside whatif mode"
 
+    # Without a seeded cursor a "delta" would silently re-scan the whole
+    # mailbox; this raises instead (before any destination call).
+    since = delta_since(ctx, "mail", "mail", "mail")
+
     ms_user = gc.get(f"/users/{user.dest_id}", params={"$select": "id"})
     ms_user_id: str = ms_user["id"]
-
-    since: str | None = None
-    if ctx.mode == "delta":
-        with session_scope() as s:
-            since = get_cursor(s, user.source_id, "mail")
-        if not since:
-            # Without a seeded cursor a "delta" would silently re-scan the whole
-            # mailbox; refuse instead (matches the files workload).
-            log.warning("No mail cursor for %s — run a full pass first; skipping", user.source_id)
-            return
 
     import_mode: str = ctx.config.workloads.mail.import_mode
     folder_cache: dict[str, str] = {}  # folder_path → graph_folder_id
@@ -89,6 +84,20 @@ def run_mail(ctx: JobContext) -> None:
             if is_done(s, user.source_id, "mail", msg.source_id):
                 continue
 
+        if msg.load_mime is not None and not msg.fetch_error:
+            # Lazy body: read from the source only now that the message is known
+            # to need importing, so a re-run does not download migrated mail.
+            try:
+                raw = msg.load_mime()
+            except Exception as exc:  # noqa: BLE001 - source read failed for this item
+                msg.fetch_error = str(exc)
+            else:
+                if raw is None:
+                    # Deleted between list and fetch — nothing to migrate.
+                    log.warning("Message %s vanished before fetch — skipping", msg.source_id)
+                    continue
+                msg.raw_mime = raw
+
         if msg.fetch_error:
             # The connector could not read this message from the source. Fail
             # just this item (holding the cursor) rather than the whole mailbox.
@@ -130,18 +139,7 @@ def run_mail(ctx: JobContext) -> None:
                 log.warning("Extra folder copy %s failed for %s (primary imported): %s",
                             folder_path, msg.source_id, exc)
 
-    new_cursor = ctx.source.get_last_cursor("mail")
-    if new_cursor:
-        if failures:
-            # Advancing the cursor past failed items would drop them from every
-            # future delta; keep the old cursor so the next run retries them.
-            log.warning(
-                "%d message(s) failed for %s — mail cursor not advanced; "
-                "they will be retried on the next run", failures, user.source_id,
-            )
-        else:
-            with session_scope() as s:
-                save_cursor(s, user.source_id, "mail", new_cursor)
+    advance_cursor(ctx, "mail", failures, "message(s)")
 
 
 def _whatif_mail(ctx: JobContext) -> None:

@@ -98,12 +98,21 @@ def _exit_if_failures(failed_users: int, since: datetime) -> None:
     failed items — so scripted cutovers can't mistake a bad run for success."""
     with session_scope() as s:
         failed_items = count_failed_items_since(s, since)
+        outstanding = count_failed_items_since(s, datetime(1970, 1, 1))
     if failed_users or failed_items:
         console.print(
             f"[red]Run finished with failures: {failed_users} user run(s), "
             f"{failed_items} item(s). State is kept — re-run to retry."
         )
         raise typer.Exit(1)
+    if outstanding:
+        # A clean delta does not revisit items that failed in an earlier pass and
+        # now sit behind the cursor; say so rather than let exit 0 imply "all done".
+        console.print(
+            f"[yellow]{outstanding} item(s) from earlier runs are still marked failed "
+            "(all users). A delta does not retry them — re-run the full workload command "
+            "for those users; `migrator validate` shows where they are."
+        )
 
 
 def _run_single(workload: str, config: Path, user: str | None, mode: str = "full") -> None:

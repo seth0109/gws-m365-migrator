@@ -121,6 +121,12 @@ class Microsoft365SourceConfig(BaseModel):
     certificate_thumbprint: Thumbprint = None
     client_secret: str | None = None
     token_cache_file: Path = Path(".ms_source_token_cache.json")
+    # Read mail, contacts and events with ids that do not change when the item is
+    # moved to another folder (Prefer: IdType="ImmutableId"). Without it a moved
+    # message looks new to the next pass and is migrated a second time. The ids
+    # are the state DB's keys, so this must not be flipped once a pass has run:
+    # set false only to keep a state DB that was built before this option.
+    immutable_ids: bool = True
 
 
 SourceConfig = Annotated[

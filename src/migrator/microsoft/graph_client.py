@@ -23,6 +23,13 @@ log = logging.getLogger(__name__)
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 _MAX_RETRIES = 7
 
+# Outlook item ids (message, event, contact) change when the item is moved to
+# another folder. This preference makes Graph return ids that stay the same for
+# as long as the item is in the mailbox; it applies per request, so a client
+# that wants them sends it on every call. Folder and calendar ids are constant
+# either way. https://learn.microsoft.com/graph/outlook-immutable-id
+_IMMUTABLE_ID = 'IdType="ImmutableId"'
+
 
 def _is_retryable(exc: BaseException) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
@@ -79,8 +86,9 @@ class GraphClient:
     cloud and the national clouds. Absolute URLs (nextLink, deltaLink, uploadUrl)
     are sent as-is."""
 
-    # Class-level default so a client built without __init__ still has a root.
+    # Class-level defaults so a client built without __init__ still works.
     _base: str = GRAPH_BASE
+    _immutable_ids: bool = False
 
     def __init__(
         self,
@@ -89,8 +97,13 @@ class GraphClient:
         per_user_limiter: PerUserRateLimiter | None = None,
         timeout: float = 60.0,
         base_url: str | None = None,
+        immutable_ids: bool = False,
     ) -> None:
         self._token_provider = token_provider
+        # Ask for Outlook item ids that survive a move between folders (see
+        # _IMMUTABLE_ID). Used for a *source* tenant, where those ids are the
+        # keys the state DB recognises already-migrated items by.
+        self._immutable_ids = immutable_ids
         self._global_limiter_name = global_limiter_name
         self._per_user_limiter = per_user_limiter
         self._timeout = timeout
@@ -130,7 +143,13 @@ class GraphClient:
         if auth:
             headers["Authorization"] = f"Bearer {self._token_provider.get_token()}"
             headers["Content-Type"] = "application/json"
+            if self._immutable_ids:
+                headers["Prefer"] = _IMMUTABLE_ID
         if extra:
+            extra = dict(extra)
+            if "Prefer" in headers and "Prefer" in extra:
+                # Preferences combine (RFC 7240); a caller's must not drop ours.
+                extra["Prefer"] = f"{headers['Prefer']}, {extra['Prefer']}"
             headers.update(extra)  # caller may override Content-Type, add Content-Range, etc.
         return headers
 

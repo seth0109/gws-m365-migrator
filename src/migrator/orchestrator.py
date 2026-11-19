@@ -22,6 +22,7 @@ from .microsoft.graph_client import GraphClient
 from .ratelimit import PerUserRateLimiter, registry
 from .state.db import init_db, session_scope
 from .state.models import JobRun
+from .workloads.cursors import NoDeltaCursor
 
 log = logging.getLogger(__name__)
 
@@ -70,9 +71,15 @@ class Orchestrator:
         return self._source_token_provider
 
     def source_graph_client(self) -> GraphClient:
+        s = self.config.source
+        assert isinstance(s, Microsoft365SourceConfig)
         return GraphClient(
             token_provider=self._get_source_token_provider(),
             per_user_limiter=self._per_user_limiter,
+            # Source message/contact/event ids are the state DB's keys for
+            # "already migrated": they must not change when the user files an
+            # item into another folder between two passes.
+            immutable_ids=s.immutable_ids,
         )
 
     def _build_source(self) -> BaseSource:
@@ -157,6 +164,11 @@ class Orchestrator:
                     try:
                         future.result()
                         log.info("Completed %s for %s", workload_name, user.source_id)
+                    except NoDeltaCursor as exc:
+                        # An operator instruction, not a crash: one line, and it
+                        # still counts as a failed run so the CLI exits 1.
+                        failed += 1
+                        log.error("Skipped %s delta: %s", workload_name, exc)
                     except Exception:
                         failed += 1
                         log.exception("Failed %s for %s", workload_name, user.source_id)

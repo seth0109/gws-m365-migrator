@@ -15,15 +15,14 @@ from ..microsoft.calendar import (
 )
 from ..microsoft.graph_client import GraphClient
 from ..state.db import (
-    get_cursor,
     get_dest_id,
     get_item_state,
-    save_cursor,
     session_scope,
     upsert_item,
 )
 from ..state.models import ItemMap
 from ..transform.identities import IdentityMap
+from .cursors import NoDeltaCursor, advance_cursor, delta_since
 
 log = logging.getLogger(__name__)
 
@@ -46,18 +45,17 @@ def run_calendar(ctx: JobContext) -> None:
     # migrated events don't reference dead source mailboxes.
     identities = IdentityMap(ctx.config.users)
 
+    unseeded: list[str] = []
     for cal in ctx.source.list_calendars(user):
-        ms_cal_id = ensure_calendar(gc, ms_user_id, cal.name)
         key = f"calendar:{cal.cal_id}"
-
-        since: str | None = None
-        if ctx.mode == "delta":
-            with session_scope() as s:
-                since = get_cursor(s, user.source_id, key)
-            if not since:
-                log.warning("No cursor for %s calendar %s — run a full pass first; skipping",
-                            user.source_id, cal.name)
-                continue
+        try:
+            since = delta_since(ctx, key, f"calendar '{cal.name}'", "calendar")
+        except NoDeltaCursor:
+            # Never read by a full pass (or created since): keep going with the
+            # other calendars, then fail the run so it is not mistaken for done.
+            unseeded.append(cal.name)
+            continue
+        ms_cal_id = ensure_calendar(gc, ms_user_id, cal.name)
 
         failures = 0
         exceptions: list[SourceEvent] = []
@@ -125,14 +123,14 @@ def run_calendar(ctx: JobContext) -> None:
             if not _apply_exception(gc, ms_user_id, user.source_id, key, exc_event, identities):
                 failures += 1
 
-        new_cursor = ctx.source.get_last_cursor(key)
-        if new_cursor:
-            if failures:
-                log.warning("%d event(s) failed in %s calendar %s — cursor not advanced",
-                            failures, user.source_id, cal.name)
-            else:
-                with session_scope() as s:
-                    save_cursor(s, user.source_id, key, new_cursor)
+        advance_cursor(ctx, key, failures, f"event(s) in calendar '{cal.name}'")
+
+    if unseeded:
+        raise NoDeltaCursor(
+            f"no sync cursor for calendar(s) {', '.join(repr(n) for n in unseeded)} of "
+            f"{user.source_id}: no full pass has read them (new calendars included), so the "
+            f"delta skipped them. Run `migrator calendar --user {user.source_id}` first."
+        )
 
 
 def _whatif_calendar(ctx: JobContext) -> None:

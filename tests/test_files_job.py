@@ -170,7 +170,34 @@ def test_failed_folder_fails_its_children_instead_of_rooting_them(tmp_path: Path
     with session_scope() as s:
         from migrator.state.db import get_cursor
 
-        assert get_cursor(s, "a@s", "files") is None  # held back for the retry
+        # First full pass: the cursor is seeded despite the failures, so one bad
+        # folder cannot make delta passes impossible. The failed rows stay failed
+        # and a full re-run retries them.
+        assert get_cursor(s, "a@s", "files") == "tok-2"
+
+
+def test_failures_never_advance_an_existing_cursor(tmp_path: Path) -> None:
+    init_db(tmp_path / "s.db")
+    with session_scope() as s:
+        save_cursor(s, "a@s", "files", "tok-1")
+    gc = _DriveGC(fail_folders={"Broken"})
+    for mode in ("full", "delta"):
+        _run([_folder("F1", "Broken"), _file("X2", "ok.pdf", None)], gc, mode=mode)
+        with session_scope() as s:
+            from migrator.state.db import get_cursor
+
+            # Held: the failed item stays inside the next delta's window.
+            assert get_cursor(s, "a@s", "files") == "tok-1"
+
+
+def test_delta_without_a_cursor_fails_instead_of_skipping(tmp_path: Path) -> None:
+    from migrator.workloads.cursors import NoDeltaCursor
+
+    init_db(tmp_path / "s.db")
+    gc = _DriveGC()
+    with pytest.raises(NoDeltaCursor, match="migrator files --user a@s"):
+        _run([_file("X1", "a.pdf", None)], gc, mode="delta")
+    assert gc.uploads == [] and gc.root_gets == 0  # nothing touched the destination
 
 
 def test_delta_update_failure_keeps_dest_id(tmp_path: Path) -> None:

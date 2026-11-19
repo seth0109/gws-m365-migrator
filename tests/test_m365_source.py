@@ -91,14 +91,35 @@ def _source(gc: _GC) -> M365Source:
 # ── mail ──────────────────────────────────────────────────────────────────────
 
 
-def test_iter_messages_skips_vanished_and_stubs_failed_fetches() -> None:
+def test_iter_messages_lists_without_downloading_and_loads_on_demand() -> None:
     gc = _GC()
     msgs = list(_source(gc).iter_messages(_USER, None))
-    assert [m.source_id for m in msgs] == ["m1", "m500"]  # 404 skipped, not fatal
-    assert msgs[0].raw_mime == b"raw" and msgs[0].folder_paths == ["Inbox"]
-    assert msgs[1].raw_mime == b"" and msgs[1].fetch_error.startswith("500")
+    assert [m.source_id for m in msgs] == ["m1", "m404", "m500"]
+    assert msgs[0].folder_paths == ["Inbox"]
+    # Listing downloads nothing: the job reads a body only for a message it is
+    # about to import, so a re-run over a migrated mailbox costs no MIME fetches.
+    assert gc.byte_calls == [] and all(m.raw_mime == b"" for m in msgs)
+
+    loaders = {m.source_id: m.load_mime for m in msgs}
+    assert all(callable(fn) for fn in loaders.values())
+    assert loaders["m1"]() == b"raw"  # type: ignore[misc]
+    assert loaders["m404"]() is None  # type: ignore[misc]  # deleted since the listing
+    with pytest.raises(RuntimeError, match="^500: InternalServerError"):
+        loaders["m500"]()  # type: ignore[misc]
+    assert [p for p, _ in gc.byte_calls] == [
+        f"/users/UID/messages/{mid}/$value" for mid in ("m1", "m404", "m500")
+    ]
     # the expected-404 probe is quieted rather than logged as a Graph error
     assert all(kw.get("quiet_statuses") == (404,) for _p, kw in gc.byte_calls)
+
+
+def test_mail_delta_filter_overlaps_the_cursor() -> None:
+    # The cursor is this machine's clock at the start of the previous pass; the
+    # filter reaches 10 minutes before it so clock skew cannot open a gap.
+    gc = _GC()
+    list(_source(gc).iter_messages(_USER, "2026-11-19T20:05:00Z"))
+    page = next(p for p in gc.pages if p.startswith("/users/UID/messages"))
+    assert "$filter=receivedDateTime ge 2026-11-19T19:55:00Z" in page
 
 
 def test_system_folders_are_found_by_well_known_name_not_display_name() -> None:
@@ -201,7 +222,8 @@ def test_iter_contacts_delta_filters_every_collection() -> None:
     list(_source(gc).iter_contacts(_USER, "2026-01-01T00:00:00Z"))
     contact_pages = [p for p in gc.pages if p.split("?")[0].endswith("/contacts")]
     assert len(contact_pages) == 3
-    assert all("$filter=lastModifiedDateTime ge 2026-01-01T00:00:00Z" in p for p in contact_pages)
+    # ...from 10 minutes before the cursor (see test_mail_delta_filter_overlaps_the_cursor)
+    assert all("$filter=lastModifiedDateTime ge 2025-12-31T23:50:00Z" in p for p in contact_pages)
 
 
 def test_fetch_contact_photo_uses_folder_qualified_path() -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -36,6 +36,12 @@ class SourceMessage:
     # source (transient error): the job fails just this item and holds the
     # cursor instead of the whole mailbox run aborting mid-enumeration.
     fetch_error: str = ""
+    # Lazy body. When set, `raw_mime` starts empty and the job calls this only
+    # for a message it is actually going to import (after the idempotency
+    # check), so a re-run does not download mail that is already migrated.
+    # Returns None when the message no longer exists at the source; raises when
+    # it could not be read (the job fails just that item).
+    load_mime: Callable[[], bytes | None] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass

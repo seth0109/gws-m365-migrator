@@ -28,6 +28,7 @@ from ..state.db import (
     upsert_item,
 )
 from ..state.models import ItemMap
+from .cursors import advance_cursor, delta_since
 
 log = logging.getLogger(__name__)
 
@@ -91,6 +92,9 @@ def run_files(ctx: JobContext) -> None:
     gc = ctx.dest_gc
     assert gc is not None, "GraphClient required outside whatif mode"
 
+    # A delta with no seeded cursor raises here, before any destination call.
+    since = delta_since(ctx, "files", "files", "files")
+
     ms_user = gc.get(f"/users/{user.dest_id}", params={"$select": "id"})
     ms_user_id: str = ms_user["id"]
 
@@ -101,28 +105,11 @@ def run_files(ctx: JobContext) -> None:
 
     drive_root = f"users/{ms_user_id}/drive"  # personal files → OneDrive
 
-    since: str | None = None
-    if ctx.mode == "delta":
-        with session_scope() as s:
-            since = get_cursor(s, user.source_id, "files")
-        if not since:
-            log.warning("No files cursor found for %s — run a full pass first", user.source_id)
-            return
-
     failures = _migrate(
         ctx, gc, drive_root, ms_user_id, ctx.source.iter_files(user, since), workload="files"
     )
 
-    new_cursor = ctx.source.get_last_cursor("files")
-    if new_cursor:
-        if failures:
-            # Advancing past failed items would drop them from every future
-            # delta; keep the old cursor so the next run retries them.
-            log.warning("%d file(s) failed for %s — files cursor not advanced",
-                        failures, user.source_id)
-        else:
-            with session_scope() as s:
-                save_cursor(s, user.source_id, "files", new_cursor)
+    advance_cursor(ctx, "files", failures, "file(s)")
 
 
 def run_shared_drives(ctx: JobContext) -> None:

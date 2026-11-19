@@ -2,7 +2,8 @@
 
 Covers the job-loop invariants the writers can't test alone: idempotent
 reruns, the done-before-extras ordering that prevents duplicate imports,
-failure-gated cursor persistence, and unseeded-delta refusal.
+cursor seeding and holding around failures, unseeded-delta refusal, and lazy
+message bodies.
 """
 from __future__ import annotations
 
@@ -10,11 +11,14 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from migrator.config import Config, UserMapping
 from migrator.connectors.base import BaseSource, SourceMessage
 from migrator.context import JobContext
 from migrator.state.db import get_cursor, init_db, session_scope
 from migrator.state.models import ItemMap
+from migrator.workloads.cursors import NoDeltaCursor
 from migrator.workloads.mail_job import run_mail
 
 # ── fakes ─────────────────────────────────────────────────────────────────────
@@ -94,10 +98,11 @@ def _run(
     mode: str = "full",
     import_mode: str = "json",
     fresh_db: bool = True,
+    cursor: str = "hist-42",
 ) -> _MailSource:
     if fresh_db:
         init_db(tmp_path / "state.db")
-    source = _MailSource(messages)
+    source = _MailSource(messages, cursor)
     ctx = JobContext(
         user=UserMapping(source_id="a@old.com", dest_id="a@new.com"),
         source=source, dest_gc=gc, mode=mode, config=_config(import_mode),  # type: ignore[arg-type]
@@ -147,26 +152,55 @@ def test_mime_patch_failure_never_duplicates_on_rerun(tmp_path: Path) -> None:
     assert len(gc.posts) == 1  # no duplicate second import
 
 
-def test_failed_import_holds_cursor_then_recovers(tmp_path: Path) -> None:
+def test_failure_in_the_first_full_pass_still_seeds_the_cursor(tmp_path: Path) -> None:
+    # One message that keeps failing must not make delta passes impossible: the
+    # first full pass seeds the cursor, the failed row stays failed, and a full
+    # re-run retries exactly that item.
     gc = _DestGC(fail_posts={2})
     _run(tmp_path, [_msg("m1"), _msg("m2")], gc)
     statuses = _item_statuses()
     assert statuses["m1"][0] == "done"
     assert statuses["m2"][0] == "failed"
     with session_scope() as s:
-        assert get_cursor(s, "a@old.com", "mail") is None  # held back
+        assert get_cursor(s, "a@old.com", "mail") == "hist-42"
 
     healthy = _DestGC()
-    _run(tmp_path, [_msg("m1"), _msg("m2")], healthy, fresh_db=False)
+    _run(tmp_path, [_msg("m1"), _msg("m2")], healthy, fresh_db=False, cursor="hist-50")
     assert len(healthy.posts) == 1  # only the failed item was retried
     assert _item_statuses()["m2"][0] == "done"
     with session_scope() as s:
-        assert get_cursor(s, "a@old.com", "mail") == "hist-42"  # clean run advances
+        assert get_cursor(s, "a@old.com", "mail") == "hist-50"  # clean run advances
 
 
-def test_unseeded_delta_refuses(tmp_path: Path) -> None:
+def test_failure_never_advances_an_existing_cursor(tmp_path: Path) -> None:
+    # With a cursor stored, a failed item holds it — in a delta and in a full
+    # re-run alike — so the item stays inside the next delta's window.
+    _run(tmp_path, [_msg("m1")], _DestGC())  # clean first pass: cursor hist-42
+    for mode in ("delta", "full"):
+        gc = _DestGC(fail_posts={1})
+        _run(tmp_path, [_msg("m1"), _msg("m2")], gc, mode=mode, fresh_db=False, cursor="hist-50")
+        assert _item_statuses()["m2"][0] == "failed"
+        with session_scope() as s:
+            assert get_cursor(s, "a@old.com", "mail") == "hist-42"  # held back
+
+    _run(tmp_path, [_msg("m2")], _DestGC(), mode="delta", fresh_db=False, cursor="hist-51")
+    assert _item_statuses()["m2"][0] == "done"
+    with session_scope() as s:
+        assert get_cursor(s, "a@old.com", "mail") == "hist-51"
+
+
+def test_unseeded_delta_fails_loudly_and_touches_nothing(tmp_path: Path) -> None:
+    # A delta with no cursor used to warn and return: exit 0 with new mail left
+    # behind. It is an error the operator has to see.
     gc = _DestGC()
-    source = _run(tmp_path, [_msg("m1")], gc, mode="delta")
+    init_db(tmp_path / "state.db")
+    source = _MailSource([_msg("m1")])
+    ctx = JobContext(
+        user=UserMapping(source_id="a@old.com", dest_id="a@new.com"),
+        source=source, dest_gc=gc, mode="delta", config=_config(),  # type: ignore[arg-type]
+    )
+    with pytest.raises(NoDeltaCursor, match="migrator mail --user a@old.com"):
+        run_mail(ctx)
     assert gc.posts == []
     assert source.last_since == "UNSET"  # iter_messages never called
 
@@ -183,7 +217,7 @@ def test_seeded_delta_passes_cursor(tmp_path: Path) -> None:
     assert len(gc.posts) == 1
 
 
-def test_fetch_error_fails_only_that_item_and_holds_cursor(tmp_path: Path) -> None:
+def test_fetch_error_fails_only_that_item(tmp_path: Path) -> None:
     from sqlalchemy import select
 
     gc = _DestGC()
@@ -197,6 +231,58 @@ def test_fetch_error_fails_only_that_item_and_holds_cursor(tmp_path: Path) -> No
     assert statuses["m2"][0] == "failed"
     assert statuses["m3"][0] == "done"
     with session_scope() as s:
-        assert get_cursor(s, "a@old.com", "mail") is None  # held for the retry
         err = s.execute(select(ItemMap.last_error).where(ItemMap.source_id == "m2")).scalar_one()
     assert err == "503 from source"  # the source error, not a misleading "empty MIME"
+
+
+# ── lazy message bodies ──────────────────────────────────────────────────────
+
+
+def _lazy(msg_id: str, loads: list[str], result: bytes | None | Exception) -> SourceMessage:
+    """A message whose MIME is read on demand, recording each read."""
+
+    def load() -> bytes | None:
+        loads.append(msg_id)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    return SourceMessage(source_id=msg_id, raw_mime=b"", folder_paths=["Inbox"], load_mime=load)
+
+
+def test_lazy_body_is_read_only_for_messages_that_get_imported(tmp_path: Path) -> None:
+    loads: list[str] = []
+    raw = _msg("x").raw_mime
+    messages = [_lazy("m1", loads, raw), _lazy("m2", loads, raw)]
+
+    gc = _DestGC()
+    _run(tmp_path, messages, gc)
+    assert loads == ["m1", "m2"] and len(gc.posts) == 2
+
+    # Re-run: both are done, so nothing is downloaded from the source again.
+    loads.clear()
+    _run(tmp_path, messages + [_lazy("m3", loads, raw)], gc, fresh_db=False)
+    assert loads == ["m3"] and len(gc.posts) == 3
+
+
+def test_lazy_body_vanished_is_skipped_and_unreadable_fails_only_that_item(
+    tmp_path: Path,
+) -> None:
+    from sqlalchemy import select
+
+    loads: list[str] = []
+    raw = _msg("x").raw_mime
+    gc = _DestGC()
+    _run(tmp_path, [
+        _lazy("gone", loads, None),                       # deleted since the listing
+        _lazy("bad", loads, RuntimeError("503: ServiceUnavailable")),
+        _lazy("ok", loads, raw),
+    ], gc)
+    assert len(gc.posts) == 1
+    statuses = _item_statuses()
+    assert "gone" not in statuses            # nothing to migrate, nothing recorded
+    assert statuses["bad"][0] == "failed"
+    assert statuses["ok"][0] == "done"
+    with session_scope() as s:
+        err = s.execute(select(ItemMap.last_error).where(ItemMap.source_id == "bad")).scalar_one()
+    assert err == "503: ServiceUnavailable"

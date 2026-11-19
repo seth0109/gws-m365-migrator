@@ -95,6 +95,30 @@ def test_full_pass_creates_and_records_hash(tmp_path: Path) -> None:
     assert _row("c1") == ("done", "dest-1", "h1")
 
 
+def test_delta_without_a_cursor_fails_instead_of_skipping(tmp_path: Path) -> None:
+    import pytest
+
+    from migrator.workloads.cursors import NoDeltaCursor
+
+    init_db(tmp_path / "s.db")
+    gc = _GC()
+    with pytest.raises(NoDeltaCursor, match="migrator contacts --user a@old.com"):
+        _run([_contact("c1", "Ann", "h1")], gc, mode="delta")
+    assert gc.posts == []
+
+
+def test_failure_in_the_first_full_pass_still_seeds_the_cursor(tmp_path: Path) -> None:
+    class _FailingCreate(_GC):
+        def post(self, path: str, **kw: Any) -> dict[str, Any]:
+            raise RuntimeError("create boom")
+
+    init_db(tmp_path / "s.db")
+    _run([_contact("c1", "Ann", "h1")], _FailingCreate())
+    assert _row("c1")[0] == "failed"
+    with session_scope() as s:
+        assert get_cursor(s, "a@old.com", "contacts") == "tok-2"  # deltas can still run
+
+
 def test_full_rerun_skips_done_even_if_hash_changed(tmp_path: Path) -> None:
     init_db(tmp_path / "s.db")
     _run([_contact("c1", "Ann", "h1")], _GC())

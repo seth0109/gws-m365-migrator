@@ -253,8 +253,9 @@ Per-user commands take `--user/-u <source_id>`; `--user` that matches no configu
 ### Behaviour to know
 
 - **Exit codes.** Migration commands exit 1 when the run left anything behind: a failed user run or any item that ended `failed`. Safe for scripted cutovers.
-- **Retries.** Re-run the same command. Done items are skipped, failed items retried, and a workload's sync cursor is only advanced by a run with zero failures, so nothing falls behind the delta.
-- **Delta semantics.** Files, contacts, and calendar events changed at the source are updated in place; deleted contacts and cancelled events are removed. Mail delta adds new messages only.
+- **Retries.** Re-run the same full command. Done items are skipped and failed items retried; with a Microsoft 365 source a re-run lists the mailbox but downloads only what it still has to import. A run that ends cleanly but leaves items failed from earlier runs says so.
+- **Delta needs a finished full pass.** The first full pass of each workload stores a sync cursor; `delta` starts from it. A delta for a user or workload with no cursor is reported as a failed run (exit 1), never skipped quietly. Items that fail during a delta hold its cursor, so the next delta retries them; items that failed in the first full pass are retried by re-running the full command.
+- **Delta semantics.** A delta brings over what is *new*, and updates files, contacts and calendar events that changed. It is not a two-way or mirror sync: mail delta adds new messages only (read/unread, flags, moves between folders and deletions made after a message was migrated are not replayed), and with a Microsoft 365 source deletions of contacts, events and files are not propagated either. Keep the gap between the full pass and cutover short, and run a delta immediately before and after cutover.
 - **State files** are written to the working directory and are gitignored: `migration_state.db` (id maps, folder maps, cursors, job log; **never delete it between runs**), `migrator.log`, the token caches, the whatif CSV, and the HTML report. The CSV and report contain real subjects, file names, and addresses.
 
 ---
@@ -264,6 +265,7 @@ Per-user commands take `--user/-u <source_id>`; `--user` that matches no configu
 - **Google Shared Drives.** List each drive in `shared_drives[]` with a `target_site_alias`; `migrator shared-drives` provisions a private team site per drive (reused on re-runs) and copies the library. Native Docs/Sheets/Slides are exported to Office formats; Forms and Apps Script are skipped and listed in the whatif CSV.
 - **Gmail labels.** A message's first user label becomes its folder and the rest become Outlook categories (`multi_label_policy: categories`), or `duplicate` copies it into every label's folder. Starred → follow-up flag; Important → an "Important" category. Spam/Trash are migrated to Junk Email / Deleted Items unless `include_spam_trash: false`.
 - **Tenant-to-tenant SharePoint.** Each `sharepoint_sites[]` entry names a `source_site` and either an existing `dest_site` or a `target_site_alias` to provision.
+- **Microsoft 365 source item ids.** Mail, contacts and events are read with ids that survive a move between folders (`source.immutable_ids`, default `true`), so a message the user files elsewhere between two passes is not migrated twice. The ids are the keys of `migration_state.db`: do not change this setting once a pass has run.
 - **Calendar caution.** Verify on one pilot mailbox whether creating events with attendees sends invitations in your tenant before running `calendar` at scale (tracked in `TODO.md`).
 
 ---

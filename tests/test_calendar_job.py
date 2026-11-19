@@ -103,6 +103,36 @@ def test_full_pass_creates_in_calendar_and_records_hash(tmp_path: Path) -> None:
         assert get_cursor(s, "a@old.com", _KEY) == "sync-2"
 
 
+def test_delta_syncs_seeded_calendars_then_fails_for_one_without_a_cursor(tmp_path: Path) -> None:
+    import pytest
+
+    from migrator.workloads.cursors import NoDeltaCursor
+
+    class _TwoCalendars(_Src):
+        def list_calendars(self, user: UserMapping) -> list[CalendarRef]:
+            # "Side project" was created at the source after the full pass.
+            return [CalendarRef("cal-new", "Side project"), CalendarRef("cal-1", "Work")]
+
+        def iter_events(
+            self, user: UserMapping, cal: CalendarRef, since: str | None
+        ) -> Iterator[SourceEvent]:
+            assert cal.cal_id == "cal-1", "an unseeded calendar must not be read in a delta"
+            yield from super().iter_events(user, cal, since)
+
+    init_db(tmp_path / "s.db")
+    _seed_delta_cursor()
+    gc = _GC()
+    src = _TwoCalendars([_event("e1", "Standup", "h1")])
+    with pytest.raises(NoDeltaCursor, match="'Side project'.*migrator calendar --user a@old.com"):
+        run_calendar(JobContext(_USER, src, gc, "delta", _CFG))  # type: ignore[arg-type]
+    # The seeded calendar was still synced and its cursor advanced; nothing was
+    # created for the new one (a full `calendar` run migrates it).
+    assert gc.posts == [("/users/ms-uid/calendars/mscal/events", {"subject": "Standup"})]
+    with session_scope() as s:
+        assert get_cursor(s, "a@old.com", _KEY) == "sync-2"
+        assert get_cursor(s, "a@old.com", "calendar:cal-new") is None
+
+
 def test_full_rerun_skips_done(tmp_path: Path) -> None:
     init_db(tmp_path / "s.db")
     _run([_event("e1", "Standup", "h1")], _GC())

@@ -58,6 +58,10 @@ source:
 #   # ...or a client secret instead of the two certificate fields.
 #   # client_secret: "SOURCE-APP-SECRET"
 #   token_cache_file: .ms_source_token_cache.json          # default
+#   # Read mail/contacts/events with ids that survive a move between folders, so
+#   # an item the user files elsewhere is not migrated twice. Leave it on; never
+#   # change it once a pass has run (the ids are the state DB's keys).
+#   immutable_ids: true                                    # default
 
 # -- DESTINATION (always Microsoft 365) ---------------------------------------
 destination:

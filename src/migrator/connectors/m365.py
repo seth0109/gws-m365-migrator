@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from functools import partial
 from typing import Any
 
 import httpx
@@ -50,8 +51,27 @@ _WELLKNOWN_TO_TOKEN = {
 }
 
 
+_TS = "%Y-%m-%dT%H:%M:%SZ"
+
+# Mail, contacts and calendar deltas filter on a timestamp taken from *this
+# machine's* clock at the start of the previous pass. A clock running ahead of
+# Exchange, or an item surfacing a little after its own timestamp, would
+# otherwise leave a gap no later delta ever reads. Each delta therefore re-reads
+# a window before its cursor; items already migrated are recognised by id (and
+# change key), so the overlap costs a listing and nothing else.
+_DELTA_OVERLAP = timedelta(minutes=10)
+
+
 def _now_z() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime(_TS)
+
+
+def _with_overlap(since: str) -> str:
+    try:
+        stamp = datetime.strptime(since, _TS)
+    except ValueError:
+        return since  # not one of our timestamps: use it as given
+    return (stamp - _DELTA_OVERLAP).strftime(_TS)
 
 
 def _whitelist(src: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
@@ -154,35 +174,37 @@ class M365Source(BaseSource):
         select = "id,parentFolderId,isRead,flag,categories,subject"
         path = f"/users/{uid}/messages?$select={select}&$top=50"
         if since:
-            path += f"&$filter=receivedDateTime ge {since}"
+            path += f"&$filter=receivedDateTime ge {_with_overlap(since)}"
         for msg in self._paginate(path, user_key=uid):
-            folder = folder_paths.get(msg.get("parentFolderId", ""), "Inbox")
-            try:
-                raw = self._client().get_bytes(
-                    f"/users/{uid}/messages/{msg['id']}/$value",
-                    user_key=uid, quiet_statuses=(404,),
-                )
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == 404:
-                    # Deleted between list and fetch — nothing to migrate.
-                    log.warning("Message %s vanished before fetch — skipping", msg["id"])
-                    continue
-                # Retries are exhausted at this point; fail just this item.
-                yield SourceMessage(
-                    source_id=msg["id"], raw_mime=b"", folder_paths=[folder],
-                    fetch_error=f"{exc.response.status_code}: {exc.response.text[:200]}",
-                )
-                continue
             yield SourceMessage(
                 source_id=msg["id"],
-                raw_mime=raw,
-                folder_paths=[folder],
+                raw_mime=b"",
+                # The MIME is read only if the job is going to import the
+                # message: a re-run lists the mailbox but downloads nothing
+                # that is already migrated.
+                load_mime=partial(self._fetch_mime, uid, msg["id"]),
+                folder_paths=[folder_paths.get(msg.get("parentFolderId", ""), "Inbox")],
                 categories=msg.get("categories", []),
                 is_read=msg.get("isRead", True),
                 is_flagged=(msg.get("flag", {}) or {}).get("flagStatus") == "flagged",
                 dedup_hash=msg["id"],
                 subject=msg.get("subject", ""),
             )
+
+    def _fetch_mime(self, uid: str, message_id: str) -> bytes | None:
+        """Raw RFC822 of one message; None if it was deleted since the listing."""
+        try:
+            return self._client().get_bytes(
+                f"/users/{uid}/messages/{message_id}/$value",
+                user_key=uid, quiet_statuses=(404,),
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return None
+            # Retries are exhausted at this point; the job fails just this item.
+            raise RuntimeError(
+                f"{exc.response.status_code}: {exc.response.text[:200]}"
+            ) from exc
 
     def inventory_messages(self, user: UserMapping) -> Iterator[SourceMessage]:
         uid = self._uid(user)
@@ -295,7 +317,7 @@ class M365Source(BaseSource):
         for path, folder_name in self._contact_collections(uid):
             query = f"{path}?$top=100"
             if since:
-                query += f"&$filter=lastModifiedDateTime ge {since}"
+                query += f"&$filter=lastModifiedDateTime ge {_with_overlap(since)}"
             for c in self._paginate(query, user_key=uid):
                 yield self._to_contact(c, path, folder_name)
 
@@ -355,7 +377,7 @@ class M365Source(BaseSource):
         self._set_cursor(f"calendar:{cal.cal_id}", _now_z())
         path = f"/users/{uid}/calendars/{cal.cal_id}/events?$top=50"
         if since:
-            path += f"&$filter=lastModifiedDateTime ge {since}"
+            path += f"&$filter=lastModifiedDateTime ge {_with_overlap(since)}"
         for e in self._paginate(path, user_key=uid):
             cancelled = e.get("isCancelled", False)
             yield SourceEvent(

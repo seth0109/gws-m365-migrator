@@ -124,6 +124,42 @@ def test_upload_session_put_omits_authorization() -> None:
     assert seen[0].headers.get("Content-Type") != "application/json"
 
 
+def test_immutable_ids_preference_is_sent_on_every_graph_request_only_when_asked() -> None:
+    # Outlook item ids change when an item is moved between folders unless each
+    # request carries this preference; a source client is built with it.
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        if req.url.path == "/v1.0/col":
+            return httpx.Response(200, json={
+                "value": [1], "@odata.nextLink": "https://graph.microsoft.com/v1.0/col2",
+            })
+        return httpx.Response(200, json={"value": [], "id": "x"})
+
+    gc = GraphClient(_StubTokens(), immutable_ids=True)  # type: ignore[arg-type]
+    gc._client.close()
+    gc._client = httpx.Client(transport=httpx.MockTransport(handler))
+    gc.get("/users/u/messages")
+    gc.get_bytes("/users/u/messages/m1/$value")
+    list(gc.paginate("/col"))  # ...including the nextLink follow-up
+    assert len(seen) == 4
+    assert all(r.headers["Prefer"] == 'IdType="ImmutableId"' for r in seen)
+
+    # A caller's own preference is combined with it, not swapped for it.
+    gc.get("/users/u/events", headers={"Prefer": 'outlook.timezone="UTC"'})
+    assert seen[-1].headers["Prefer"] == 'IdType="ImmutableId", outlook.timezone="UTC"'
+
+    # Pre-authenticated upload hosts get neither the token nor the preference.
+    gc.put_raw("https://up.example.com/session", data=b"x")
+    assert "Prefer" not in seen[-1].headers and "Authorization" not in seen[-1].headers
+
+    # Default (the destination client): no preference at all.
+    plain = _client_with(handler)
+    plain.get("/users/u/messages")
+    assert "Prefer" not in seen[-1].headers
+
+
 def test_paginate_does_not_duplicate_params_on_nextlink() -> None:
     seen: list[httpx.Request] = []
 

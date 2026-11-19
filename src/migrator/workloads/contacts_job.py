@@ -10,7 +10,8 @@ from ..microsoft.contacts import (
     set_contact_photo,
     update_contact,
 )
-from ..state.db import get_cursor, get_item_state, save_cursor, session_scope, upsert_item
+from ..state.db import get_item_state, session_scope, upsert_item
+from .cursors import advance_cursor, delta_since
 
 log = logging.getLogger(__name__)
 
@@ -26,15 +27,8 @@ def run_contacts(ctx: JobContext) -> None:
     gc = ctx.dest_gc
     assert gc is not None, "GraphClient required outside whatif mode"
 
-    since: str | None = None
-    if ctx.mode == "delta":
-        with session_scope() as s:
-            since = get_cursor(s, user.source_id, "contacts")
-        if not since:
-            # No seeded cursor: a "delta" would silently re-scan everything.
-            log.warning("No contacts cursor for %s — run a full pass first; skipping",
-                        user.source_id)
-            return
+    # No seeded cursor: a "delta" would silently re-scan everything — this raises.
+    since = delta_since(ctx, "contacts", "contacts", "contacts")
 
     ms_user = gc.get(f"/users/{user.dest_id}", params={"$select": "id"})
     ms_user_id: str = ms_user["id"]
@@ -115,16 +109,7 @@ def run_contacts(ctx: JobContext) -> None:
                     status="failed", last_error=str(exc),
                 )
 
-    new_cursor = ctx.source.get_last_cursor("contacts")
-    if new_cursor:
-        if failures:
-            # Advancing past failed items would drop them from every future
-            # delta; keep the old cursor so the next run retries them.
-            log.warning("%d contact(s) failed for %s — contacts cursor not advanced",
-                        failures, user.source_id)
-        else:
-            with session_scope() as s:
-                save_cursor(s, user.source_id, "contacts", new_cursor)
+    advance_cursor(ctx, "contacts", failures, "contact(s)")
 
 
 def _whatif_contacts(ctx: JobContext) -> None:
