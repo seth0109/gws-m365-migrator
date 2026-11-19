@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import string
+import unicodedata
 from pathlib import Path
 from typing import Annotated, Literal, NamedTuple
 
@@ -20,6 +22,42 @@ def normalize_token(value: object) -> object:
     if isinstance(value, str):
         return value.strip().lower().replace("-", "_").replace(" ", "_")
     return value
+
+
+def normalize_thumbprint(value: object) -> object:
+    """Reduce a certificate thumbprint to 40 bare hex digits, or raise ValueError.
+
+    MSAL hex-decodes the thumbprint exactly as given, so one pasted the way the
+    tools print it only fails deep inside the token provider, as a bare
+    `binascii.Error: Odd-length string`. Accepted here: `sha1 Fingerprint=AB:CD:..`
+    (openssl), `ab cd ..` (the Windows certificate dialog, which also prepends an
+    invisible left-to-right mark) and dashes. Blank means "not set"."""
+    if not isinstance(value, str):
+        return value
+    digits = "".join(
+        ch
+        for ch in value.rpartition("=")[2]
+        if not (ch.isspace() or ch in ":-" or unicodedata.category(ch) == "Cf")
+    )
+    if not digits:
+        return None
+    if any(ch not in string.hexdigits for ch in digits):
+        raise ValueError(
+            "certificate thumbprint must be hex digits (0-9, A-F), optionally "
+            "separated by ':' or spaces"
+        )
+    if len(digits) != 40:
+        sha256 = " (64 digits is the SHA-256 fingerprint)" if len(digits) == 64 else ""
+        raise ValueError(
+            "certificate thumbprint must be the certificate's SHA-1 thumbprint: 40 hex "
+            f"digits, got {len(digits)}{sha256}. Print it with: "
+            "openssl x509 -in <cert> -noout -fingerprint -sha1"
+        )
+    return digits.upper()
+
+
+# SHA-1 thumbprint of the certificate uploaded to the app registration.
+Thumbprint = Annotated[str | None, BeforeValidator(normalize_thumbprint)]
 
 
 # --------------------------------------------------------------------------- #
@@ -80,7 +118,7 @@ class Microsoft365SourceConfig(BaseModel):
     client_id: str
     cloud: M365Cloud = "global"  # national cloud of the SOURCE tenant
     certificate_path: Path | None = None
-    certificate_thumbprint: str | None = None
+    certificate_thumbprint: Thumbprint = None
     client_secret: str | None = None
     token_cache_file: Path = Path(".ms_source_token_cache.json")
 
@@ -105,7 +143,7 @@ class Microsoft365DestinationConfig(BaseModel):
     client_id: str
     cloud: M365Cloud = "global"  # national cloud of the DESTINATION tenant
     certificate_path: Path | None = None
-    certificate_thumbprint: str | None = None
+    certificate_thumbprint: Thumbprint = None
     client_secret: str | None = None
     token_cache_file: Path = Path(".ms_token_cache.json")
     # Owner (UPN or object id) stamped on auto-provisioned M365 groups/sites.

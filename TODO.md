@@ -21,6 +21,12 @@ This file is the single source of truth for the backlog (`CLAUDE.md` points here
   percent-encoded in path-based addressing; a raw `#` (possible from an M365
   source, which does not sanitize names) became a URL fragment and truncated
   the upload path.
+- **Certificate thumbprints are normalized and validated at config load.**
+  A thumbprint pasted as `openssl` prints it (`AB:CD:..`, 59 characters) loaded
+  fine and then failed the smoke test inside MSAL with a bare
+  `binascii.Error: Odd-length string`. Separators are now stripped, and a value
+  that is not 40 hex digits is rejected naming the tenant block (`init-config`
+  names the flag).
 
 ## Recently completed (2026-09-17 mechanism review)
 

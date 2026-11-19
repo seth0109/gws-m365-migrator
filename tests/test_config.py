@@ -99,3 +99,119 @@ def test_example_users_csv_parses() -> None:
 
     users = parse_mapping_csv(_EXAMPLE.with_name("users.example.csv"))
     assert [u.get("mailbox_type", "user") for u in users] == ["user", "user", "shared"]
+
+
+# ── certificate thumbprint ───────────────────────────────────────────────────
+# MSAL hex-decodes the thumbprint as given. One pasted with the separators the
+# tools print (59 characters with colons) used to load fine and then fail the
+# first token request with a bare `binascii.Error: Odd-length string`.
+
+import binascii  # noqa: E402
+from typing import Any  # noqa: E402
+
+import pytest  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
+
+from migrator.auth import ms_auth  # noqa: E402
+from migrator.auth.ms_auth import MSTokenProvider  # noqa: E402
+
+_TP = "AABBCCDDEEFF00112233445566778899AABBCCDD"
+_PAIRS = [_TP[i:i + 2] for i in range(0, 40, 2)]
+
+
+def _m365(thumbprint: object, **extra: Any) -> dict[str, Any]:
+    return {
+        "tenant_id": "t", "client_id": "c", "certificate_path": "key.pem",
+        "certificate_thumbprint": thumbprint, **extra,
+    }
+
+
+def _thumbprint_config(source_tp: object, dest_tp: object = _TP) -> Config:
+    return Config.model_validate({
+        "source": _m365(source_tp, type="microsoft365"),
+        "destination": _m365(dest_tp, cloud="gcc_high"),
+        "users": [{"source_id": "a@src", "dest_id": "a@dst"}],
+    })
+
+
+@pytest.mark.parametrize(
+    "pasted",
+    [
+        _TP,
+        _TP.lower(),
+        ":".join(_PAIRS),                           # openssl x509 -fingerprint
+        "sha1 Fingerprint=" + ":".join(_PAIRS),     # ...the whole output line
+        " ".join(_PAIRS).lower(),                   # Windows certificate dialog
+        "‎" + " ".join(_PAIRS) + "\n",         # ...with its invisible LRM mark
+        "-".join(_PAIRS),
+    ],
+)
+def test_thumbprint_is_reduced_to_bare_hex(pasted: str) -> None:
+    cfg = _thumbprint_config(pasted, pasted)
+    assert cfg.source.type == "microsoft365"
+    for block in (cfg.source, cfg.destination):
+        assert block.certificate_thumbprint == _TP
+        assert len(binascii.a2b_hex(block.certificate_thumbprint)) == 20  # what MSAL does
+
+
+@pytest.mark.parametrize(
+    ("bad", "message"),
+    [
+        (_TP[:-1], "40 hex digits, got 39"),          # dropped a character
+        (_TP + "0", "40 hex digits, got 41"),
+        ("AB" * 32, "SHA-256"),                       # -sha256 fingerprint
+        ("thumbprint-goes-here", "must be hex digits"),
+    ],
+)
+def test_bad_thumbprint_is_rejected_at_load_naming_the_block(bad: str, message: str) -> None:
+    with pytest.raises(ValidationError) as dest_err:
+        _thumbprint_config(_TP, bad)
+    assert message in str(dest_err.value)
+    assert dest_err.value.errors()[0]["loc"] == ("destination", "certificate_thumbprint")
+
+    with pytest.raises(ValidationError) as src_err:
+        _thumbprint_config(bad)
+    assert src_err.value.errors()[0]["loc"] == (
+        "source", "microsoft365", "certificate_thumbprint"
+    )
+
+
+def test_blank_thumbprint_means_not_set() -> None:
+    cfg = Config.model_validate({
+        "source": {"type": "imap", "host": "h"},
+        "destination": {
+            "tenant_id": "t", "client_id": "c", "client_secret": "s",
+            "certificate_thumbprint": "  ",
+        },
+        "users": [{"source_id": "a", "dest_id": "b"}],
+    })
+    assert cfg.destination.certificate_thumbprint is None
+
+
+def test_colon_separated_thumbprint_reaches_msal_decodable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[str] = []
+
+    class _DecodingMsalApp:
+        """Does to the thumbprint what msal's JwtAssertionCreator does."""
+
+        def __init__(self, client_id: str, client_credential: Any = None, **_kw: Any) -> None:
+            binascii.a2b_hex(client_credential["thumbprint"])
+            seen.append(client_credential["thumbprint"])
+
+    monkeypatch.setattr(ms_auth.msal, "ConfidentialClientApplication", _DecodingMsalApp)
+    key = tmp_path / "key.pem"
+    key.write_bytes(b"-----BEGIN PRIVATE KEY-----\n")
+    block = {
+        "tenant_id": "t", "client_id": "c", "certificate_path": str(key),
+        "certificate_thumbprint": ":".join(_PAIRS),
+    }
+    cfg = Config.model_validate({
+        "source": {**block, "type": "microsoft365"},
+        "destination": {**block, "cloud": "gcc_high"},
+        "users": [{"source_id": "a@src", "dest_id": "a@dst"}],
+    })
+    MSTokenProvider.from_config(cfg.source)  # type: ignore[arg-type]
+    MSTokenProvider.from_config(cfg.destination)
+    assert seen == [_TP, _TP]

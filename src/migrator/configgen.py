@@ -20,7 +20,7 @@ from pathlib import Path
 
 import yaml
 
-from .config import CLOUD_ENDPOINTS, Config, normalize_token
+from .config import CLOUD_ENDPOINTS, Config, normalize_thumbprint, normalize_token
 
 # Source types that can be scaffolded.
 SOURCE_TYPES = ("google_workspace", "imap", "microsoft365")
@@ -214,6 +214,17 @@ def _resolve_cloud(value: str, flag: str) -> str:
     return cloud
 
 
+def _resolve_thumbprint(value: str, flag: str) -> str:
+    """Bare-hex form of a thumbprint option; a bad value names its flag."""
+    try:
+        thumbprint = normalize_thumbprint(value)
+    except ValueError as exc:
+        raise ConfigGenError(f"{flag}: {exc}") from exc
+    if not thumbprint:
+        raise ConfigGenError(f"{flag} is empty.")
+    return str(thumbprint)
+
+
 def _ms_block(
     tenant_id: str, client_id: str, cert: Path, thumbprint: str, cache: str, cloud: str
 ) -> dict[str, object]:
@@ -285,14 +296,15 @@ def build_config_dict(
             source_tenant_id,  # type: ignore[arg-type]
             source_client_id,  # type: ignore[arg-type]
             creds.source_cert,
-            source_thumbprint,  # type: ignore[arg-type]
+            _resolve_thumbprint(source_thumbprint or "", "--source-thumbprint"),
             ".ms_source_token_cache.json",
             _resolve_cloud(source_cloud, "--source-cloud"),
         )
 
     assert creds.dest_cert is not None
     destination = _ms_block(
-        dest_tenant_id, dest_client_id, creds.dest_cert, dest_thumbprint,
+        dest_tenant_id, dest_client_id, creds.dest_cert,
+        _resolve_thumbprint(dest_thumbprint, "--thumbprint"),
         ".ms_token_cache.json", dest_cloud,
     )
 

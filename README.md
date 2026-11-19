@@ -70,7 +70,7 @@ Create an app registration in the **destination** tenant, upload a certificate, 
 ```bash
 openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \
   -subj "/CN=gws-m365-migrator" -keyout credentials/ms-key.pem -out ms-cert.crt
-openssl x509 -in ms-cert.crt -noout -fingerprint -sha1     # thumbprint, drop the colons
+openssl x509 -in ms-cert.crt -noout -fingerprint -sha1     # SHA-1 thumbprint: 40 hex digits (colons are accepted)
 ```
 
 Upload `ms-cert.crt` to the app registration (Certificates & secrets) and keep `credentials/ms-key.pem` local; `config.yaml` points `certificate_path` at the key file. A `client_secret` is accepted instead, but only by hand-editing the config.

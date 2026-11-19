@@ -73,8 +73,9 @@ destination:
   # For gcc_high / dod the app registration must be created in that cloud
   # (portal.azure.us), and SharePoint site addresses end in .sharepoint.us.
   cloud: global
-  # Certificate auth (preferred): PEM PRIVATE KEY file + SHA-1 thumbprint (no
-  # colons) of the certificate uploaded to the app registration.
+  # Certificate auth (preferred): PEM PRIVATE KEY file + SHA-1 thumbprint of the
+  # certificate uploaded to the app registration: 40 hex digits. Colons or
+  # spaces between the pairs are accepted; anything else is rejected at load.
   certificate_path: credentials/ms-key.pem
   certificate_thumbprint: "AABBCCDDEEFF00112233445566778899AABBCCDD"
   # Or a client secret instead of the two certificate fields:

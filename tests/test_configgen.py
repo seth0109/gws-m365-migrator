@@ -13,6 +13,10 @@ from migrator.configgen import (
     parse_mapping_csv,
 )
 
+# SHA-1 thumbprints: 40 hex digits (anything else is rejected at validation).
+_TP = "AABBCCDDEEFF00112233445566778899AABBCCDD"
+_SRC_TP = "112233445566778899AABBCCDDEEFF0011223344"
+
 
 # --------------------------------------------------------------------------- #
 # Credential discovery
@@ -150,12 +154,12 @@ def test_build_google_config_valid(tmp_path: Path) -> None:
         users=[{"source_id": "a@old.com", "dest_id": "a@new.com"}],
         dest_tenant_id="t",
         dest_client_id="c",
-        dest_thumbprint="AABB",
+        dest_thumbprint=_TP,
         admin_email="admin@old.com",
     )
     model = Config.model_validate(cfg)
     assert model.source.type == "google_workspace"
-    assert model.destination.certificate_thumbprint == "AABB"
+    assert model.destination.certificate_thumbprint == _TP
     # Round-trips through YAML.
     assert "google_workspace" in dump_config_yaml(cfg)
 
@@ -168,7 +172,7 @@ def test_build_google_requires_admin_email(tmp_path: Path) -> None:
             users=[{"source_id": "a", "dest_id": "b"}],
             dest_tenant_id="t",
             dest_client_id="c",
-            dest_thumbprint="x",
+            dest_thumbprint=_TP,
         )
 
 
@@ -179,7 +183,7 @@ def test_build_imap_config_valid(tmp_path: Path) -> None:
         users=[{"source_id": "a@old.com", "dest_id": "a@new.com"}],
         dest_tenant_id="t",
         dest_client_id="c",
-        dest_thumbprint="x",
+        dest_thumbprint=_TP,
         imap_host="imap.old.com",
         imap_port=143,
         imap_ssl=False,
@@ -198,7 +202,7 @@ def test_build_imap_requires_host(tmp_path: Path) -> None:
             users=[{"source_id": "a", "dest_id": "b"}],
             dest_tenant_id="t",
             dest_client_id="c",
-            dest_thumbprint="x",
+            dest_thumbprint=_TP,
         )
 
 
@@ -209,15 +213,15 @@ def test_build_m365_config_valid(tmp_path: Path) -> None:
         users=[{"source_id": "a@src.com", "dest_id": "a@dst.com"}],
         dest_tenant_id="t",
         dest_client_id="c",
-        dest_thumbprint="x",
+        dest_thumbprint=_TP,
         source_tenant_id="st",
         source_client_id="sc",
-        source_thumbprint="sx",
+        source_thumbprint=_SRC_TP,
     )
     model = Config.model_validate(cfg)
     assert model.source.type == "microsoft365"
     assert model.source.tenant_id == "st"
-    assert model.source.certificate_thumbprint == "sx"
+    assert model.source.certificate_thumbprint == _SRC_TP
 
 
 def test_build_m365_requires_source_creds(tmp_path: Path) -> None:
@@ -228,7 +232,7 @@ def test_build_m365_requires_source_creds(tmp_path: Path) -> None:
             users=[{"source_id": "a", "dest_id": "b"}],
             dest_tenant_id="t",
             dest_client_id="c",
-            dest_thumbprint="x",
+            dest_thumbprint=_TP,
         )
 
 
@@ -240,7 +244,7 @@ def test_build_unknown_source_type_raises(tmp_path: Path) -> None:
             users=[{"source_id": "a", "dest_id": "b"}],
             dest_tenant_id="t",
             dest_client_id="c",
-            dest_thumbprint="x",
+            dest_thumbprint=_TP,
         )
 
 
@@ -254,7 +258,7 @@ def test_build_writes_destination_cloud(tmp_path: Path) -> None:
         users=[{"source_id": "a@old.com", "dest_id": "a@new.us"}],
         dest_tenant_id="t",
         dest_client_id="c",
-        dest_thumbprint="x",
+        dest_thumbprint=_TP,
         imap_host="imap.old.com",
         dest_cloud="GCC High",
     )
@@ -270,10 +274,10 @@ def test_build_m365_source_and_destination_clouds_are_independent(tmp_path: Path
         users=[{"source_id": "a@src.com", "dest_id": "a@dst.us"}],
         dest_tenant_id="t",
         dest_client_id="c",
-        dest_thumbprint="x",
+        dest_thumbprint=_TP,
         source_tenant_id="st",
         source_client_id="sc",
-        source_thumbprint="sx",
+        source_thumbprint=_SRC_TP,
         dest_cloud="gcc_high",
     )
     model = Config.model_validate(cfg)
@@ -289,9 +293,50 @@ def test_build_unknown_cloud_raises(tmp_path: Path) -> None:
             users=[{"source_id": "a", "dest_id": "b"}],
             dest_tenant_id="t",
             dest_client_id="c",
-            dest_thumbprint="x",
+            dest_thumbprint=_TP,
             imap_host="h",
             dest_cloud="gcchigh",
+        )
+
+
+def test_build_writes_pasted_thumbprints_as_bare_hex(tmp_path: Path) -> None:
+    # `openssl x509 -fingerprint -sha1` prints colons; the YAML must not carry them.
+    cfg = build_config_dict(
+        source_type="microsoft365",
+        creds=_creds(tmp_path, src=True),
+        users=[{"source_id": "a@src.com", "dest_id": "a@dst.us"}],
+        dest_tenant_id="t",
+        dest_client_id="c",
+        dest_thumbprint="sha1 Fingerprint=" + ":".join(_TP[i:i + 2] for i in range(0, 40, 2)),
+        source_tenant_id="st",
+        source_client_id="sc",
+        source_thumbprint=" ".join(_SRC_TP[i:i + 2] for i in range(0, 40, 2)).lower(),
+    )
+    assert cfg["destination"]["certificate_thumbprint"] == _TP  # type: ignore[index]
+    assert cfg["source"]["certificate_thumbprint"] == _SRC_TP  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "flag"),
+    [
+        ({"dest_thumbprint": _TP[:-1], "source_thumbprint": _SRC_TP}, "--thumbprint: "),
+        ({"dest_thumbprint": _TP, "source_thumbprint": _SRC_TP[:-1]}, "--source-thumbprint: "),
+        ({"dest_thumbprint": "  ", "source_thumbprint": _SRC_TP}, "--thumbprint is empty"),
+    ],
+)
+def test_build_bad_thumbprint_names_the_flag(
+    tmp_path: Path, kwargs: dict[str, str], flag: str
+) -> None:
+    with pytest.raises(ConfigGenError, match=flag):
+        build_config_dict(
+            source_type="microsoft365",
+            creds=_creds(tmp_path, src=True),
+            users=[{"source_id": "a", "dest_id": "b"}],
+            dest_tenant_id="t",
+            dest_client_id="c",
+            source_tenant_id="st",
+            source_client_id="sc",
+            **kwargs,
         )
 
 
@@ -311,7 +356,7 @@ def test_parse_mapping_mailbox_type_column(tmp_path: Path) -> None:
     ]
     cfg = build_config_dict(
         source_type="imap", creds=_creds(tmp_path), users=users,
-        dest_tenant_id="t", dest_client_id="c", dest_thumbprint="x", imap_host="h",
+        dest_tenant_id="t", dest_client_id="c", dest_thumbprint=_TP, imap_host="h",
     )
     assert [u.mailbox_type for u in Config.model_validate(cfg).users] == [
         "user", "user", "shared",
