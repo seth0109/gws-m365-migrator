@@ -144,6 +144,7 @@ class GoogleWorkspaceSource(BaseSource):
         else:
             changed, new_token = iter_drive_changes(self.cfg, user.source_id, since)
             self._set_cursor("files", new_token)
+            self._set_expected("files", len(changed))
             for gfile in changed:
                 yield self._to_file(gfile)
 
@@ -241,6 +242,7 @@ class GoogleWorkspaceSource(BaseSource):
     def iter_contacts(self, user: UserMapping, since: str | None) -> Iterator[SourceContact]:
         contacts, new_token = iter_contacts(self.cfg, user.source_id, since)
         self._set_cursor("contacts", new_token)
+        self._set_expected("contacts", len(contacts))
         group_names = self._group_names(user)
         for contact in contacts:
             yield self._to_contact(contact, group_names)
@@ -329,6 +331,7 @@ class GoogleWorkspaceSource(BaseSource):
     ) -> Iterator[SourceEvent]:
         events, new_token = iter_events(self.cfg, user.source_id, cal.cal_id, since)
         self._set_cursor(f"calendar:{cal.cal_id}", new_token)
+        self._set_expected(f"calendar:{cal.cal_id}", len(events))
         for event in events:
             event_id = event.get("id", "")
             if not event_id:

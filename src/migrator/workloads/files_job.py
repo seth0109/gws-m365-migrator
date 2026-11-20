@@ -105,9 +105,8 @@ def run_files(ctx: JobContext) -> None:
 
     drive_root = f"users/{ms_user_id}/drive"  # personal files → OneDrive
 
-    failures = _migrate(
-        ctx, gc, drive_root, ms_user_id, ctx.source.iter_files(user, since), workload="files"
-    )
+    items = ctx.track(ctx.source.iter_files(user, since), "files")
+    failures = _migrate(ctx, gc, drive_root, ms_user_id, items, workload="files")
 
     advance_cursor(ctx, "files", failures, "file(s)")
 
@@ -447,7 +446,7 @@ def _whatif_files(ctx: JobContext) -> None:
     assert manifest is not None, "ManifestWriter must be set in whatif mode"
     user = ctx.user
 
-    for f in ctx.source.inventory_files(user):
+    for f in ctx.track(ctx.source.inventory_files(user), "files"):
         if f.action == "create-folder":
             action = "create-folder"
         elif f.action == "export":

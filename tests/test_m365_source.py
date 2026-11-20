@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from migrator.config import Microsoft365SourceConfig, UserMapping
-from migrator.connectors.base import SourceFile
+from migrator.connectors.base import CalendarRef, SourceFile
 from migrator.connectors.m365 import M365Source, _drive_key
 from migrator.microsoft.graph_client import GraphClient
 
@@ -240,6 +240,159 @@ def test_mail_folder_requests_are_valid_against_v1_mailfolder() -> None:
 
     assert src._folder_paths("UID") == {"f1": "Inbox", "f9": "DeletedItems"}
     assert all(r.method == "GET" for r in seen)  # a source is only ever read
+
+
+# ── how much is coming (progress totals) ──────────────────────────────────────
+
+
+class _CountingGC(_GC):
+    """_GC answering the way Graph does when asked how much there is: mail
+    folders carry `totalItemCount`, and `$count=true` returns `@odata.count`."""
+
+    folder_items = {"f1": 40, "f2": 7, "f3": 0, "f4": 3}
+    collection_items = {
+        "/users/UID/contacts": 1,
+        "/users/UID/contactFolders/cf1/contacts": 1,
+        "/users/UID/contactFolders/cf2/contacts": 1,
+        "/users/UID/calendars/cal1/events": 12,
+    }
+    refuse_counts = False
+
+    def get(self, path: str, **kwargs: Any) -> dict[str, Any]:
+        if "$count=true" not in path:
+            return super().get(path, **kwargs)
+        self.gets.append((path, kwargs))
+        if self.refuse_counts:
+            raise _status_error(400, "count is not supported here")
+        return {"@odata.count": self.collection_items[path.split("?")[0]], "value": []}
+
+    def paginate(self, path: str, **kwargs: Any) -> Iterator[list[dict[str, Any]]]:
+        if path.split("?")[0].endswith("/events"):
+            self.pages.append(path)
+            yield [{"id": "e1", "subject": "Standup", "changeKey": "k"}]
+            return
+        for page in super().paginate(path, **kwargs):
+            yield [
+                {**row, "totalItemCount": self.folder_items[row["id"]]}
+                if row["id"] in self.folder_items else row
+                for row in page
+            ]
+
+    def count_requests(self) -> list[str]:
+        return [path for path, _ in self.gets if "$count=true" in path]
+
+
+def test_mail_listing_expects_what_the_folders_say_they_hold() -> None:
+    gc = _CountingGC()
+    src = _source(gc)
+    assert src.expected_total("mail") is None  # nothing has been listed yet
+    next(src.iter_messages(_USER, None))
+    assert src.expected_total("mail") == 50  # 40 + 7 + 0 + 3: the sub-folder counts too
+    # Read off the folder listing the connector makes anyway: no request is
+    # added, and no `$count` over messages (slow, by Microsoft's own account).
+    assert gc.count_requests() == []
+    folder_pages = [p for p in gc.pages if "olders" in p.split("?")[0]]
+    assert folder_pages and all(
+        p.endswith("$select=id,displayName,totalItemCount") for p in folder_pages
+    )
+
+
+def test_mail_listing_expects_nothing_when_the_folders_report_no_counts() -> None:
+    src = _source(_GC())
+    next(src.iter_messages(_USER, None))
+    assert src.expected_total("mail") is None  # unknown, not zero
+
+
+def test_mail_inventory_is_sized_the_same_way() -> None:
+    src = _source(_CountingGC())
+    next(src.inventory_messages(_USER))
+    assert src.expected_total("mail") == 50
+
+
+def test_a_date_filtered_mail_delta_has_no_expected_total() -> None:
+    cfg = Microsoft365SourceConfig(tenant_id="t", client_id="c")
+    # Replay off: the delta lists only recent mail, which the folder counts
+    # (the whole mailbox) would overstate into a bar that never moves.
+    recent = M365Source(cfg, lambda: _CountingGC(), replay_mail_state=False)  # type: ignore[arg-type, return-value]
+    next(recent.iter_messages(_USER, "2026-01-01T00:00:00Z"))
+    assert recent.expected_total("mail") is None
+    # Replay on: the delta goes through the whole mailbox, so the counts apply.
+    whole = M365Source(cfg, lambda: _CountingGC(), replay_mail_state=True)  # type: ignore[arg-type, return-value]
+    next(whole.iter_messages(_USER, "2026-01-01T00:00:00Z"))
+    assert whole.expected_total("mail") == 50
+
+
+def test_contacts_are_counted_with_one_small_request_per_folder() -> None:
+    gc = _CountingGC()
+    src = _source(gc)
+    assert len(list(src.iter_contacts(_USER, None))) == 3
+    assert src.expected_total("contacts") == 3
+    assert gc.count_requests() == [
+        "/users/UID/contacts?$count=true&$top=1&$select=id",
+        "/users/UID/contactFolders/cf1/contacts?$count=true&$top=1&$select=id",
+        "/users/UID/contactFolders/cf2/contacts?$count=true&$top=1&$select=id",
+    ]
+
+
+def test_a_delta_counts_only_what_it_is_going_to_list() -> None:
+    gc = _CountingGC()
+    list(_source(gc).iter_contacts(_USER, "2026-01-01T00:00:00Z"))
+    counts = gc.count_requests()
+    assert len(counts) == 3
+    assert all(p.endswith("&$filter=lastModifiedDateTime ge 2025-12-31T23:50:00Z") for p in counts)
+
+
+def test_events_are_counted_per_calendar() -> None:
+    gc = _CountingGC()
+    src = _source(gc)
+    assert len(list(src.iter_events(_USER, CalendarRef("cal1", "Calendar"), None))) == 1
+    assert src.expected_total("calendar:cal1") == 12
+    assert gc.count_requests() == ["/users/UID/calendars/cal1/events?$count=true&$top=1&$select=id"]
+
+
+def test_a_count_graph_will_not_give_is_unknown_not_an_error() -> None:
+    gc = _CountingGC()
+    gc.refuse_counts = True
+    src = _source(gc)
+    assert len(list(src.iter_contacts(_USER, None))) == 3  # the listing is untouched
+    assert src.expected_total("contacts") is None
+    assert len(gc.count_requests()) == 1  # ...and the other folders are not asked
+
+
+def test_a_response_without_a_count_is_unknown() -> None:
+    src = _source(_GC())  # answers 200 without @odata.count
+    list(src.iter_contacts(_USER, None))
+    assert src.expected_total("contacts") is None
+
+
+def test_a_refused_count_is_not_logged_as_a_graph_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Real GraphClient: the count is a nicety, so a 400 on it must not put an
+    error in the log of an otherwise healthy run."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.params.get("$count") == "true":
+            return httpx.Response(400, json={"error": {"code": "BadRequest"}})
+        if req.url.path.endswith("/contacts"):
+            return httpx.Response(200, json={"value": [{"id": "c1", "displayName": "Ann"}]})
+        if req.url.path.endswith(("/contactFolders", "/childFolders")):
+            return httpx.Response(200, json={"value": []})
+        return httpx.Response(200, json={"id": "UID"})
+
+    class _Tokens:
+        def get_token(self) -> str:
+            return "tok"
+
+    gc = GraphClient(_Tokens(), global_limiter_name="test_m365_source_unthrottled")  # type: ignore[arg-type]
+    gc._client.close()
+    gc._client = httpx.Client(transport=httpx.MockTransport(handler))
+    src = M365Source(Microsoft365SourceConfig(tenant_id="t", client_id="c"), lambda: gc)
+
+    with caplog.at_level("WARNING"):
+        contacts = list(src.iter_contacts(_USER, None))
+    assert [c.source_id for c in contacts] == ["c1"]
+    assert src.expected_total("contacts") is None
+    assert caplog.records == []
 
 
 # ── contacts ──────────────────────────────────────────────────────────────────

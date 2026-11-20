@@ -159,12 +159,24 @@ class M365Source(BaseSource):
 
     def _folder_paths(self, uid: str) -> dict[str, str]:
         """Map mailFolder id → destination folder path ("\\"-separated)."""
+        return self._mail_folders(uid)[0]
+
+    def _mail_folders(self, uid: str) -> tuple[dict[str, str], int | None]:
+        """(mailFolder id → destination folder path, items those folders hold).
+
+        The second value is the sum of each folder's `totalItemCount` — free,
+        since the folders are listed anyway, and what Microsoft documents as the
+        cheap way to count (a `$count` over messages "can incur significant
+        latency"). It is an estimate of what the /messages listing will return:
+        it counts items of every type, and mail keeps arriving. It sizes the
+        progress bar and nothing else. None when Graph reported no counts."""
         paths: dict[str, str] = {}
+        counts: list[int] = []
         well_known = self._well_known_folder_ids(uid)
 
         def walk(parent_path: str, container: str) -> None:
             for f in self._paginate(
-                f"/users/{uid}/{container}?$top=100&$select=id,displayName",
+                f"/users/{uid}/{container}?$top=100&$select=id,displayName,totalItemCount",
                 user_key=uid,
             ):
                 # Top-level system folders map to a canonical token the destination
@@ -174,23 +186,48 @@ class M365Source(BaseSource):
                 name = token if (token and not parent_path) else f.get("displayName", f["id"])
                 full = f"{parent_path}\\{name}" if parent_path else name
                 paths[f["id"]] = full
+                if isinstance(f.get("totalItemCount"), int):
+                    counts.append(f["totalItemCount"])
                 walk(full, f"mailFolders/{f['id']}/childFolders")
 
         walk("", "mailFolders")
-        return paths
+        return paths, (sum(counts) if counts else None)
+
+    def _count(self, uid: str, collections: list[str], flt: str = "") -> int | None:
+        """Best-effort number of items in Outlook collections (contacts, events),
+        for the progress display: one `$count=true` request per collection, asking
+        for a single id. None as soon as Graph does not answer with a count —
+        never an error, the listing that follows is what matters."""
+        total = 0
+        for collection in collections:
+            try:
+                data = self._client().get(
+                    f"{collection}?$count=true&$top=1&$select=id{flt}",
+                    user_key=uid, quiet_statuses=(400, 404, 501),
+                )
+            except Exception:  # noqa: BLE001 - a nicety must not fail the listing
+                return None
+            count = data.get("@odata.count") if isinstance(data, dict) else None
+            if not isinstance(count, int) or count < 0:
+                return None
+            total += count
+        return total
 
     def iter_messages(self, user: UserMapping, since: str | None) -> Iterator[SourceMessage]:
         uid = self._uid(user)
         self._set_cursor("mail", _now_z())
-        folder_paths = self._folder_paths(uid)
+        folder_paths, in_folders = self._mail_folders(uid)
         select = "id,parentFolderId,isRead,flag,categories,subject"
         path = f"/users/{uid}/messages?$select={select}&$top={_MAIL_PAGE}"
+        recent_only = ""
         if since and not self._replay_mail_state:
-            path += f"&$filter=receivedDateTime ge {_with_overlap(since)}"
+            recent_only = f"&$filter=receivedDateTime ge {_with_overlap(since)}"
         # Otherwise (a full pass, or a delta that replays read/flag state) every
         # message is listed: whether read/flag changes move lastModifiedDateTime
         # is not documented, so the state is compared rather than filtered for.
-        for msg in self._paginate(path, user_key=uid):
+        # Only then do the folder counts say how much is coming.
+        self._set_expected("mail", None if recent_only else in_folders)
+        for msg in self._paginate(path + recent_only, user_key=uid):
             is_read = bool(msg.get("isRead", True))
             is_flagged = (msg.get("flag", {}) or {}).get("flagStatus") == "flagged"
             categories = list(msg.get("categories") or [])
@@ -227,7 +264,8 @@ class M365Source(BaseSource):
 
     def inventory_messages(self, user: UserMapping) -> Iterator[SourceMessage]:
         uid = self._uid(user)
-        folder_paths = self._folder_paths(uid)
+        folder_paths, in_folders = self._mail_folders(uid)
+        self._set_expected("mail", in_folders)
         select = "id,parentFolderId,isRead,subject,from,receivedDateTime"
         for msg in self._paginate(
             f"/users/{uid}/messages?$select={select}&$top=50", user_key=uid
@@ -333,11 +371,11 @@ class M365Source(BaseSource):
     def _iter_contact_collections(
         self, uid: str, since: str | None
     ) -> Iterator[SourceContact]:
-        for path, folder_name in self._contact_collections(uid):
-            query = f"{path}?$top=100"
-            if since:
-                query += f"&$filter=lastModifiedDateTime ge {_with_overlap(since)}"
-            for c in self._paginate(query, user_key=uid):
+        flt = f"&$filter=lastModifiedDateTime ge {_with_overlap(since)}" if since else ""
+        collections = self._contact_collections(uid)
+        self._set_expected("contacts", self._count(uid, [path for path, _ in collections], flt))
+        for path, folder_name in collections:
+            for c in self._paginate(f"{path}?$top=100{flt}", user_key=uid):
                 yield self._to_contact(c, path, folder_name)
 
     def iter_contacts(self, user: UserMapping, since: str | None) -> Iterator[SourceContact]:
@@ -394,10 +432,10 @@ class M365Source(BaseSource):
     ) -> Iterator[SourceEvent]:
         uid = self._uid(user)
         self._set_cursor(f"calendar:{cal.cal_id}", _now_z())
-        path = f"/users/{uid}/calendars/{cal.cal_id}/events?$top=50"
-        if since:
-            path += f"&$filter=lastModifiedDateTime ge {_with_overlap(since)}"
-        for e in self._paginate(path, user_key=uid):
+        events = f"/users/{uid}/calendars/{cal.cal_id}/events"
+        flt = f"&$filter=lastModifiedDateTime ge {_with_overlap(since)}" if since else ""
+        self._set_expected(f"calendar:{cal.cal_id}", self._count(uid, [events], flt))
+        for e in self._paginate(f"{events}?$top=50{flt}", user_key=uid):
             cancelled = e.get("isCancelled", False)
             yield SourceEvent(
                 source_id=e["id"],

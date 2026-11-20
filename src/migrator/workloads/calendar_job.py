@@ -59,7 +59,7 @@ def run_calendar(ctx: JobContext) -> None:
 
         failures = 0
         exceptions: list[SourceEvent] = []
-        events = iter(ctx.source.iter_events(user, cal, since))
+        events = ctx.track(ctx.source.iter_events(user, cal, since), key)
         while True:
             # Advance the generator inside the try: a connector/transform error
             # on one event must not abort the remaining calendars. A generator
@@ -141,7 +141,8 @@ def _whatif_calendar(ctx: JobContext) -> None:
     user = ctx.user
 
     for cal in ctx.source.list_calendars(user):
-        for event in ctx.source.iter_events(user, cal, None):
+        events = ctx.track(ctx.source.iter_events(user, cal, None), f"calendar:{cal.cal_id}")
+        for event in events:
             manifest.add(
                 source_user=user.source_id,
                 dest_user=user.dest_id,

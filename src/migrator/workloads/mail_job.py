@@ -129,7 +129,7 @@ def run_mail(ctx: JobContext) -> None:
             )
 
     failures = 0
-    for msg in ctx.source.iter_messages(user, since):
+    for msg in ctx.track(ctx.source.iter_messages(user, since), "mail"):
         with session_scope() as s:
             state = get_item_state(s, user.source_id, "mail", msg.source_id)
         if state is not None and state.status == "done":
@@ -219,7 +219,7 @@ def _whatif_mail(ctx: JobContext) -> None:
     assert manifest is not None, "ManifestWriter must be set in whatif mode"
     user = ctx.user
 
-    for msg in ctx.source.inventory_messages(user):
+    for msg in ctx.track(ctx.source.inventory_messages(user), "mail"):
         folder_paths = msg.folder_paths or ["Inbox"]
         primary = folder_paths[0]
         notes_parts = []

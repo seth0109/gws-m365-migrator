@@ -4,8 +4,6 @@ import logging
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
-
 import migrator as _pkg
 
 from .auth.ms_auth import MSTokenProvider
@@ -19,6 +17,7 @@ from .connectors.base import BaseSource
 from .connectors.factory import build_source
 from .context import JobContext
 from .microsoft.graph_client import GraphClient
+from .progress import RunProgress
 from .ratelimit import PerUserRateLimiter, registry
 from .state.db import init_db, session_scope
 from .state.models import JobRun
@@ -147,33 +146,32 @@ class Orchestrator:
         log.info("Starting workload=%s mode=%s users=%d", workload_name, mode, len(target_users))
 
         failed = 0
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]{task.description}"),
-            TimeElapsedColumn(),
-        ) as progress:
-            task = progress.add_task(f"[cyan]{workload_name}", total=len(target_users))
-
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                futures = {
-                    pool.submit(self._run_user, workload_name, job_fn, user, mode): user
-                    for user in target_users
-                }
-                for future in as_completed(futures):
-                    user = futures[future]
-                    try:
-                        future.result()
-                        log.info("Completed %s for %s", workload_name, user.source_id)
-                    except NoDeltaCursor as exc:
-                        # An operator instruction, not a crash: one line, and it
-                        # still counts as a failed run so the CLI exits 1.
-                        failed += 1
-                        log.error("Skipped %s delta: %s", workload_name, exc)
-                    except Exception:
-                        failed += 1
-                        log.exception("Failed %s for %s", workload_name, user.source_id)
-                    finally:
-                        progress.advance(task)
+        with (
+            RunProgress(workload_name, len(target_users)) as display,
+            ThreadPoolExecutor(max_workers=max_workers) as pool,
+        ):
+            futures = {
+                pool.submit(self._run_user, workload_name, job_fn, user, mode, display): user
+                for user in target_users
+            }
+            for future in as_completed(futures):
+                user = futures[future]
+                try:
+                    items = future.result()
+                    log.info(
+                        "Completed %s for %s (%s item(s) processed)",
+                        workload_name, user.source_id, f"{items:,}",
+                    )
+                except NoDeltaCursor as exc:
+                    # An operator instruction, not a crash: one line, and it
+                    # still counts as a failed run so the CLI exits 1.
+                    failed += 1
+                    log.error("Skipped %s delta: %s", workload_name, exc)
+                except Exception:
+                    failed += 1
+                    log.exception("Failed %s for %s", workload_name, user.source_id)
+                finally:
+                    display.user_finished()
         return failed
 
     def _run_user(
@@ -182,7 +180,10 @@ class Orchestrator:
         job_fn: JobFn,
         user: UserMapping,
         mode: str,
-    ) -> None:
+        display: RunProgress,
+    ) -> int:
+        """Run one user's job; returns how many source items it went through
+        (migrated, already migrated, or failed)."""
         with session_scope() as session:
             run = JobRun(
                 user_email=user.source_id,
@@ -195,24 +196,28 @@ class Orchestrator:
             run_id = run.id
 
         try:
-            with self._build_source() as source:
+            # The user's row is on screen for as long as the job runs.
+            with display.user(user.source_id) as progress, self._build_source() as source:
                 if mode == "whatif":
                     # Inventory-only: never touch the destination. Jobs read from
                     # the source and write rows to the package-level ManifestWriter.
                     ctx = JobContext(
-                        user=user, source=source, dest_gc=None, mode=mode, config=self.config
+                        user=user, source=source, dest_gc=None, mode=mode,
+                        config=self.config, progress=progress,
                     )
                     job_fn(ctx)
                 else:
                     with self.dest_graph_client() as client:
                         ctx = JobContext(
-                            user=user, source=source, dest_gc=client, mode=mode, config=self.config
+                            user=user, source=source, dest_gc=client, mode=mode,
+                            config=self.config, progress=progress,
                         )
                         job_fn(ctx)
             with session_scope() as session:
                 done = session.get(JobRun, run_id)
                 if done:
                     done.status = "done"
+            return progress.completed
         except Exception as exc:
             with session_scope() as session:
                 failed = session.get(JobRun, run_id)

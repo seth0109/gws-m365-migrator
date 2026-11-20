@@ -4,6 +4,23 @@ Open work items identified during review, roughly ordered by data-fidelity
 impact. None of the **Open** items are wired up yet — treat as the backlog.
 This file is the single source of truth for the backlog (`CLAUDE.md` points here).
 
+## Recently completed (2026-11-20 progress display)
+
+- **Per-user progress instead of a spinner.** `Orchestrator.run_workload` draws
+  one row per user being migrated (`progress.RunProgress`): a bar with items
+  done / expected, percentage, rate and time left when the connector could
+  size its listing, a running count when it could not. Connectors report the
+  size through `BaseSource.expected_total` (same keys as the cursors): the
+  M365 source sums the mail folders' `totalItemCount` (read off the folder
+  listing it already makes) and asks for `$count=true` on contact and event
+  collections (best-effort: anything but a count means "unknown"); the Google
+  source reports the length of the result sets it buffers (contacts, events,
+  Drive delta). Jobs wrap their listing in `ctx.track(...)`. Each user's
+  position is also logged every 5 minutes (every minute when output is piped),
+  and the "Completed" line carries the item count. Totals are estimates and
+  never decide what is migrated. Unverified against a live tenant, the
+  `$count` on events in particular.
+
 ## Recently completed (2026-11-19 GCC High + shared mailboxes)
 
 - **National clouds.** `destination.cloud` / `source.cloud`
@@ -294,6 +311,18 @@ This file is the single source of truth for the backlog (`CLAUDE.md` points here
   **Change adds:** the paginate + re-resolve pattern the other folder writers use.
 
 ## Open — Coverage / functionality
+
+- **No expected totals for files, Gmail mail or IMAP mail.** Those listings
+  give no cheap count, so their progress row is a running count with no
+  percentage or time left. **Change adds:** Gmail `users.getProfile`
+  (`messagesTotal`); IMAP `STATUS (MESSAGES)` summed over the folders before
+  the first FETCH; for files either a metadata-only listing pass before the
+  upload pass or a byte-based bar from the drive's used size.
+
+- **The tenant-level flows show no progress.** `shared-drives` and
+  `sharepoint` bypass `run_workload`, so they run with the counting-only
+  `ItemProgress` and draw nothing. **Change adds:** a `RunProgress` row per
+  drive / site.
 
 - **GCC High workloads are unverified against a live tenant.** Certificate
   sign-in and Graph routing were confirmed live on 2026-11-19 (a commercial

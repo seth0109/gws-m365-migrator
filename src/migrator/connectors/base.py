@@ -156,6 +156,20 @@ class BaseSource:
 
     def __init__(self) -> None:
         self._cursors: dict[str, str] = {}
+        self._expected: dict[str, int | None] = {}
+
+    # -- progress plumbing -------------------------------------------------- #
+    def _set_expected(self, key: str, count: int | None) -> None:
+        self._expected[key] = count
+
+    def expected_total(self, key: str) -> int | None:
+        """About how many items the listing most recently started for `key`
+        (the cursor keys: "mail", "calendar:<cal_id>", ...) will yield, when the
+        source could tell cheaply; None when it could not.
+
+        An estimate for the progress display. Never use it to decide what to
+        migrate: only the listing itself says what is there."""
+        return self._expected.get(key)
 
     # -- cursor plumbing ---------------------------------------------------- #
     def _set_cursor(self, key: str, value: str | None) -> None:

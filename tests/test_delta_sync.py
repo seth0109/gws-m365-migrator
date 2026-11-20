@@ -31,6 +31,7 @@ from migrator.connectors.factory import build_source
 from migrator.context import JobContext
 from migrator.microsoft.graph_client import GraphClient
 from migrator.orchestrator import Orchestrator
+from migrator.progress import ItemProgress
 from migrator.state.db import get_cursor, init_db, session_scope
 from migrator.workloads.mail_job import run_mail
 
@@ -84,6 +85,10 @@ class _Mailbox:
         if path == "/users/UID/mailFolders":
             folders = [{"id": fid, "displayName": name} for fid, name in _FOLDERS.values()]
             folders += [{"id": fid, "displayName": name} for fid, name in _CUSTOM.items()]
+            if "totalItemCount" in req.url.params.get("$select", "").split(","):
+                for f in folders:
+                    held = [m for m in self.messages.values() if m["folder"] == f["id"]]
+                    f["totalItemCount"] = len(held)  # type: ignore[assignment]
             return httpx.Response(200, json={"value": folders})
         if path.endswith("/childFolders"):
             return httpx.Response(200, json={"value": []})
@@ -162,8 +167,9 @@ def _cfg(replay: bool = True, **source_extra: Any) -> Config:
 def _pass(
     mailbox: _Mailbox, dest: _Dest, mode: str, now: str, monkeypatch: pytest.MonkeyPatch,
     immutable_ids: bool = True, replay: bool = True,
-) -> None:
-    """One `migrator mail` run at wall-clock `now` (as this machine sees it)."""
+) -> ItemProgress:
+    """One `migrator mail` run at wall-clock `now` (as this machine sees it);
+    returns what the job reported as its progress."""
     monkeypatch.setattr(m365, "_now_z", lambda: now)
     gc = GraphClient(
         _Tokens(),  # type: ignore[arg-type]
@@ -176,7 +182,9 @@ def _pass(
     gc._client = httpx.Client(transport=httpx.MockTransport(mailbox.handler))
     cfg = _cfg(replay)
     with build_source(cfg, lambda: gc) as source:  # the connector as the factory wires it
-        run_mail(JobContext(_USER, source, dest, mode, cfg))  # type: ignore[arg-type]
+        ctx = JobContext(_USER, source, dest, mode, cfg)  # type: ignore[arg-type]
+        run_mail(ctx)
+    return ctx.progress
 
 
 def _seeded_mailbox(tmp_path: Path) -> _Mailbox:
@@ -284,6 +292,31 @@ def test_without_replay_the_delta_reads_recent_mail_only_with_an_overlap(
     assert dest.patches == []  # read state is not replayed in this mode
     (listing,) = mailbox.listings()
     assert listing.url.params["$filter"] == "receivedDateTime ge 2026-11-19T11:50:00Z"
+
+
+def test_progress_is_measured_against_the_mailbox_the_pass_goes_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mailbox, dest = _seeded_mailbox(tmp_path), _Dest()
+
+    # Full pass: three messages, and the folders say they hold three.
+    progress = _pass(mailbox, dest, "full", "2026-11-19T12:00:00Z", monkeypatch)
+    assert (progress.completed, progress.total) == (3, 3)
+
+    # A delta that replays read state goes through the whole mailbox again
+    # (nothing is downloaded twice), so that is what its bar is measured against.
+    mailbox.deliver(4, "2026-11-19T12:30:00Z")
+    mailbox.requests.clear()
+    progress = _pass(mailbox, dest, "delta", "2026-11-19T15:00:00Z", monkeypatch)
+    assert (progress.completed, progress.total) == (4, 4)
+    assert mailbox.mime_downloads() == ["imm-4"]
+
+    # Without replay the delta lists recent mail only: one message, against no
+    # total at all (the folders still hold five; 1 of 5 would never finish).
+    mailbox.deliver(5, "2026-11-19T16:00:00Z")
+    progress = _pass(mailbox, dest, "delta", "2026-11-19T18:00:00Z", monkeypatch, replay=False)
+    assert (progress.completed, progress.total) == (1, None)
+    assert len(dest.created) == 5  # the display changed nothing about what moved
 
 
 def test_orchestrator_source_client_asks_for_immutable_ids_unless_opted_out(

@@ -44,7 +44,7 @@ def run_contacts(ctx: JobContext) -> None:
     _get_folder("Imported Contacts")
 
     failures = 0
-    for contact in ctx.source.iter_contacts(user, since):
+    for contact in ctx.track(ctx.source.iter_contacts(user, since), "contacts"):
         with session_scope() as s:
             state = get_item_state(s, user.source_id, "contacts", contact.source_id)
         # A recorded dest_id means the contact exists at the destination (even
@@ -119,7 +119,7 @@ def _whatif_contacts(ctx: JobContext) -> None:
     assert manifest is not None, "ManifestWriter must be set in whatif mode"
     user = ctx.user
 
-    for contact in ctx.source.inventory_contacts(user):
+    for contact in ctx.track(ctx.source.inventory_contacts(user), "contacts"):
         manifest.add(
             source_user=user.source_id,
             dest_user=user.dest_id,
